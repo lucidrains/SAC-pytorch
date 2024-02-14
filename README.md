@@ -14,3 +14,14 @@ Implementation of Soft Actor Critic and some of its improvements in Pytorch. Int
     url     = {https://api.semanticscholar.org/CorpusID:55703664}
 }
 ```
+
+```bibtex
+@article{Hiraoka2021DropoutQF,
+    title   = {Dropout Q-Functions for Doubly Efficient Reinforcement Learning},
+    author  = {Takuya Hiraoka and Takahisa Imagawa and Taisei Hashimoto and Takashi Onishi and Yoshimasa Tsuruoka},
+    journal = {ArXiv},
+    year    = {2021},
+    volume  = {abs/2110.02034},
+    url     = {https://api.semanticscholar.org/CorpusID:238353966}
+}
+```
