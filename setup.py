@@ -18,6 +18,7 @@ setup(
   ],
   install_requires=[
     'einops>=0.7.0',
+    'einx[torch]>=0.3.0',
     'torch>=2.0'
   ],
   classifiers=[
