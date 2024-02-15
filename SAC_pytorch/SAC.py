@@ -10,6 +10,10 @@ from beartype.typing import Tuple, List, Optional, Union
 from einx import get_at
 from einops import rearrange, repeat, reduce, pack, unpack
 
+# EMA for target networks
+
+from ema_pytorch import EMA
+
 # helpers
 
 def exists(v):
@@ -63,21 +67,67 @@ def MLP(
 # main modules
 
 class Actor(Module):
-    def __init__(self):
+    def __init__(
+        self,
+        dim_state
+    ):
         super().__init__()
         raise NotImplementedError
 
 class Critic(Module):
-    """ will be 2 critics, with min of their Qs """
-
-    def __init__(self):
+    @beartype
+    def __init__(
+        self,
+        dim_state,
+        dim_actions,
+        dim_hiddens: Tuple[int, ...] = tuple(),
+        layernorm = False,
+        dropout = 0.
+    ):
         super().__init__()
-        raise NotImplementedError
 
-class Value(Module):
-    def __init__(self):
+        self.to_q = MLP(
+            dim_state + dim_actions,
+            dim_out = 1,
+            dim_hiddens = dim_hiddens,
+            layernorm = layernorm,
+            dropout = dropout
+        )
+
+    def forward(
+        self,
+        state,
+        actions
+    ):
+        state_actions = pack([state, actions], 'b *')
+
+        q_values = self.to_q(state_actions)
+        q_values = rearrange('b 1 -> b')
+
+        return q_values
+
+class ValueNetwork(Module):
+    @beartype
+    def __init__(
+        self,
+        dim_state,
+        dim_hiddens: Tuple[int, ...] = tuple()
+    ):
         super().__init__()
-        raise NotImplementedError
+
+        self.to_values = MLP(
+            dim_state,
+            dim_out= 1,
+            dim_hiddens = dim_hiddens
+        )
+
+    def forward(
+        self,
+        states
+    ):
+        values = self.to_values(states)
+        values = rearrange(values, 'b 1 -> b')
+        return values
 
 # main class
 
