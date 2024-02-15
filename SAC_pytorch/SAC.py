@@ -69,17 +69,44 @@ def MLP(
 class Actor(Module):
     def __init__(
         self,
-        dim_state
+        *,
+        dim_state,
+        num_cont_actions,
+        dim_hiddens: Tuple[int, ...] = tuple()
     ):
         super().__init__()
-        raise NotImplementedError
+        self.to_cont_actions = MLP(
+            dim_state,
+            dim_hiddens = dim_hiddens,
+            dim_out = num_cont_actions * 2
+        )
+
+    def forward(
+        self,
+        state,
+        sample = False
+    ):
+        """
+        einops notation
+        n - num actions
+        ms - mu sigma
+        """
+
+        out = self.to_cont_actions(state)
+        mu, sigma = rearrange(out, '... (n ms) -> ms ... n', ms = 2)
+
+        if not sample:
+            return mu, sigma
+
+        return mu + sigma * torch.randn_like(sigma)
 
 class Critic(Module):
     @beartype
     def __init__(
         self,
+        *,
         dim_state,
-        dim_actions,
+        num_continuous_actions,
         dim_hiddens: Tuple[int, ...] = tuple(),
         layernorm = False,
         dropout = 0.
@@ -87,7 +114,7 @@ class Critic(Module):
         super().__init__()
 
         self.to_q = MLP(
-            dim_state + dim_actions,
+            dim_state + num_continuous_actions,
             dim_out = 1,
             dim_hiddens = dim_hiddens,
             layernorm = layernorm,
@@ -110,6 +137,7 @@ class ValueNetwork(Module):
     @beartype
     def __init__(
         self,
+        *,
         dim_state,
         dim_hiddens: Tuple[int, ...] = tuple()
     ):
