@@ -126,7 +126,7 @@ class Critic(Module):
         state,
         actions
     ):
-        state_actions = pack([state, actions], 'b *')
+        state_actions, _ = pack([state, actions], 'b *')
 
         q_values = self.to_q(state_actions)
         q_values = rearrange('b 1 -> b')
