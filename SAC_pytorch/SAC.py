@@ -2,6 +2,9 @@ import torch
 from torch import nn, einsum, Tensor
 from torch.nn import Module, ModuleList
 
+from beartype import beartype
+from beartype.typing import Tuple, List, Optional, Union
+
 # ein notations
 
 from einx import get_at
@@ -11,6 +14,51 @@ from einops import rearrange, repeat, reduce, pack, unpack
 
 def exists(v):
     return v is not None
+
+def cast_tuple(t, length = 1):
+    return t if isinstance(t, tuple) else ((t,) * length)
+
+# mlp
+
+@beartype
+def MLP(
+    dim,
+    dim_out,
+    dim_hiddens: Union[int, Tuple[int, ...]],
+    layernorm = False,
+    dropout = 0.,
+    activation = nn.ReLU
+):
+    """
+    simple mlp for Q and value networks
+
+    following Figure 1 in https://arxiv.org/pdf/2110.02034.pdf for placement of dropouts and layernorm
+    however, be aware that Levine in his lecture has ablations that show layernorm alone (without dropout) is sufficient for regularization
+    """
+
+    dim_hiddens = cast_tuple(dim_hiddens)
+
+    layers = []
+
+    curr_dim = dim
+
+    for dim_hidden in dim_hiddens:
+        layers.append(nn.Linear(curr_dim, dim_hidden))
+
+        layers.append(nn.Dropout(dropout))
+
+        if layernorm:
+            layers.append(nn.LayerNorm(dim_hidden))
+
+        layers.append(activation())
+
+        curr_dim = dim_hidden
+
+    # final layer out
+
+    layers.append(nn.Linear(curr_dim, dim_out))
+
+    return nn.Sequential(*layers)
 
 # main modules
 
