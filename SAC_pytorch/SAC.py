@@ -72,9 +72,12 @@ class Actor(Module):
         *,
         dim_state,
         num_cont_actions,
-        dim_hiddens: Tuple[int, ...] = tuple()
+        dim_hiddens: Tuple[int, ...] = tuple(),
+        eps = 1e-5
     ):
         super().__init__()
+        self.eps = eps
+
         self.to_cont_actions = MLP(
             dim_state,
             dim_hiddens = dim_hiddens,
@@ -94,6 +97,8 @@ class Actor(Module):
 
         out = self.to_cont_actions(state)
         mu, sigma = rearrange(out, '... (n ms) -> ms ... n', ms = 2)
+
+        sigma = sigma.sigmoid().clamp(min = self.eps)
 
         if not sample:
             return mu, sigma
