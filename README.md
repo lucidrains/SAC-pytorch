@@ -27,3 +27,12 @@ Implementation of Soft Actor Critic and some of its improvements in Pytorch. Int
     url     = {https://api.semanticscholar.org/CorpusID:238353966}
 }
 ```
+
+```bibtex
+@inproceedings{ObandoCeron2024MixturesOE,
+    title   = {Mixtures of Experts Unlock Parameter Scaling for Deep RL},
+    author  = {Johan S. Obando-Ceron and Ghada Sokar and Timon Willi and Clare Lyle and Jesse Farebrother and Jakob Foerster and Gintare Karolina Dziugaite and Doina Precup and Pablo Samuel Castro},
+    year    = {2024},
+    url     = {https://api.semanticscholar.org/CorpusID:267637059}
+}
+```

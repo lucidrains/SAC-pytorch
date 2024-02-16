@@ -19,9 +19,10 @@ setup(
   install_requires=[
     'beartype',
     'einops>=0.7.0',
-    'einx[torch]>=0.3.0',
+    'einx[torch]>=0.1.3',
     'ema-pytorch',
     'pytorch-custom-utils>=0.0.18',
+    'soft-moe-pytorch',
     'torch>=2.0'
   ],
   classifiers=[
