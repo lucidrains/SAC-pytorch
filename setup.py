@@ -22,7 +22,7 @@ setup(
     'einx[torch]>=0.1.3',
     'ema-pytorch',
     'pytorch-custom-utils>=0.0.18',
-    'soft-moe-pytorch',
+    'soft-moe-pytorch>=0.1.6',
     'torch>=2.0'
   ],
   classifiers=[
