@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import namedtuple
 
 import torch
 from torch import nn, einsum, Tensor
@@ -7,6 +8,8 @@ from torch.nn import Module, ModuleList
 from beartype import beartype
 
 # ein notations
+# b - batch
+# n - number of actions
 
 from einx import get_at
 from einops import rearrange, repeat, reduce, pack, unpack
@@ -15,6 +18,13 @@ from einops import rearrange, repeat, reduce, pack, unpack
 
 from ema_pytorch import EMA
 
+# constants
+
+ContinuousOutput = namedtuple('ContinuousOutput', ['mu', 'sigma'])
+
+SoftActorOutput = namedtuple('SoftActorOutput', ['continuous', 'discrete'])
+SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', ['continuous', 'discrete'])
+
 # helpers
 
 def exists(v):
@@ -22,6 +32,18 @@ def exists(v):
 
 def cast_tuple(t, length = 1):
     return t if isinstance(t, tuple) else ((t,) * length)
+
+# tensor helpers
+
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1):
+    return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
 
 # mlp
 
@@ -74,38 +96,50 @@ class Actor(Module):
         *,
         dim_state,
         num_cont_actions,
+        num_discrete_actions: tuple[int, ...] = (),
         dim_hiddens: tuple[int, ...] = (),
         eps = 1e-5
     ):
         super().__init__()
         self.eps = eps
 
-        self.to_cont_actions = MLP(
+        discrete_action_dims = sum(num_discrete_actions)
+        cont_action_dims = num_cont_actions * 2
+
+        self.num_discrete_actions = num_discrete_actions
+        self.split_dims = (discrete_action_dims, cont_action_dims)
+
+        self.to_actions = MLP(
             dim_state,
             dim_hiddens = dim_hiddens,
-            dim_out = num_cont_actions * 2
+            dim_out = discrete_action_dims + cont_action_dims
         )
+
 
     def forward(
         self,
         state,
-        sample = False
+        sample = False,
+        discrete_sample_temperature = 1.
     ):
-        """
-        einops notation
-        n - num actions
-        ms - mu sigma
-        """
+        action_dims = self.to_actions(state)
 
-        out = self.to_cont_actions(state)
-        mu, sigma = rearrange(out, '... (n ms) -> ms ... n', ms = 2)
+        discrete_actions, cont_actions = action_dims.split(self.split_dims, dim = -1)
+        discrete_action_logits = discrete_actions.split(self.num_discrete_actions)
 
+        mu, sigma = rearrange(cont_actions, '... (n mu_sigma) -> mu_sigma ... n', mu_sigma = 2)
         sigma = sigma.sigmoid().clamp(min = self.eps)
 
-        if not sample:
-            return mu, sigma
+        cont_output = ContinuousOutput(mu, sigma)
+        discrete_output = discrete_action_logits
 
-        return mu + sigma * torch.randn_like(sigma)
+        if not sample:
+            return SoftActorOutput(cont_output, discrete_output)
+
+        sampled_cont = mu + sigma * torch.randn_like(sigma)
+        sampled_discrete = [gumbel_sample(logits, temperature = discrete_sample_temperature) for logits in discrete_action_logits]
+
+        return SampledSoftActorOutput(sampled_cont, sampled_discrete)
 
 class Critic(Module):
     @beartype
