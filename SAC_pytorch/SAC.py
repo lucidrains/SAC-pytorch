@@ -32,6 +32,9 @@ SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', ['continuous', 'di
 def exists(v):
     return v is not None
 
+def compact(arr):
+    return [*filter(exists, arr)]
+
 def cast_tuple(t, length = 1):
     return t if isinstance(t, tuple) else ((t,) * length)
 
@@ -226,11 +229,13 @@ class Critic(Module):
     def forward(
         self,
         state,
-        actions
+        cont_actions = None
     ):
-        state_actions, _ = pack([state, actions], 'b *')
+        pack_input = compact([state, cont_actions])
 
-        q_values = self.to_q(state_actions)
+        mlp_input, _ = pack([state, cont_actions], 'b *')
+
+        q_values = self.to_q(mlp_input)
 
         return q_values
 
@@ -246,13 +251,13 @@ class MultipleCritics(Module):
     def forward(
         self,
         states,
-        actions,
-        target = None,
+        cont_actions = None,
+        target_value = None,
     ):
-        values = [critic(states, actions) for critic in self.critics]
+        values = [critic(states, cont_actions) for critic in self.critics]
 
-        if not exists(target):
-            # double critic trick (todo: find paper, read it, and figure out if there is a new sota for this issue) for treating overestimation bias
+        if not exists(target_value):
+            # double critic trick (todo: find paper and read it) for treating overestimation bias
             min_critic_value = torch.minimum(*values)
 
             return min_critic_value, values
