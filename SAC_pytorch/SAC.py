@@ -14,6 +14,7 @@ from beartype import beartype
 
 from einx import get_at
 from einops import rearrange, repeat, reduce, pack, unpack
+from einops.layers.torch import Rearrange
 
 # EMA for target networks
 
@@ -204,19 +205,22 @@ class Critic(Module):
         self,
         *,
         dim_state,
-        num_continuous_actions,
+        num_actions,
         dim_hiddens: tuple[int, ...] = (),
         layernorm = False,
         dropout = 0.
     ):
         super().__init__()
 
-        self.to_q = MLP(
-            dim_state + num_continuous_actions,
-            dim_out = 1,
-            dim_hiddens = dim_hiddens,
-            layernorm = layernorm,
-            dropout = dropout
+        self.to_q = Sequential(
+            MLP(
+                dim_state + num_actions,
+                dim_out = 1,
+                dim_hiddens = dim_hiddens,
+                layernorm = layernorm,
+                dropout = dropout
+            ),
+            Rearrange('... 1 -> ...')
         )
 
     def forward(
@@ -227,33 +231,34 @@ class Critic(Module):
         state_actions, _ = pack([state, actions], 'b *')
 
         q_values = self.to_q(state_actions)
-        q_values = rearrange('b 1 -> b')
 
         return q_values
 
-class ValueNetwork(Module):
+class MultipleCritics(Module):
     @beartype
     def __init__(
         self,
-        *,
-        dim_state,
-        dim_hiddens: tuple[int, ...] = ()
+        *critics: Critic
     ):
         super().__init__()
-
-        self.to_values = MLP(
-            dim_state,
-            dim_out= 1,
-            dim_hiddens = dim_hiddens
-        )
+        self.critics = ModuleList(critics)
 
     def forward(
         self,
-        states
+        states,
+        actions,
+        target = None,
     ):
-        values = self.to_values(states)
-        values = rearrange(values, 'b 1 -> b')
-        return values
+        values = [critic(states, actions) for critic in self.critics]
+
+        if not exists(target):
+            # double critic trick (todo: find paper and read it) for treating overestimation bias
+            min_critic_value = torch.minimum(*values)
+
+            return min_critic_value, values
+
+        losses = [F.mse_loss(values, target) for value in values]
+        return losses
 
 # main class
 
