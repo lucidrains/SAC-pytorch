@@ -17,6 +17,7 @@ setup(
     'soft actor critic'
   ],
   install_requires=[
+    'adam-atan2-pytorch',
     'beartype',
     'einops>=0.7.0',
     'einx[torch]>=0.1.3',
