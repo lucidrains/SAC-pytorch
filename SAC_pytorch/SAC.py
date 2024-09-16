@@ -48,6 +48,7 @@ def gumbel_noise(t):
     return -log(-log(noise))
 
 def gumbel_sample(t, temperature = 1., dim = -1):
+    assert temperature > 0.
     return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
 
 # helper classes
@@ -154,7 +155,8 @@ class Actor(Module):
         self,
         state,
         sample = False,
-        discrete_sample_temperature = 1.
+        discrete_sample_temperature = 1.,
+        discrete_sample_deterministic = False
     ):
         action_dims = self.to_actions(state)
 
@@ -186,7 +188,12 @@ class Actor(Module):
         discrete_log_probs = []
 
         for logits in discrete_action_logits:
-            sampled_action = gumbel_sample(logits, temperature = discrete_sample_temperature)
+
+            if discrete_sample_deterministic:
+                sampled_action = logits.argmax(dim = -1)
+            else:
+                sampled_action = gumbel_sample(logits, temperature = discrete_sample_temperature)
+
             sampled_discrete_actions.append(sampled_action)
 
             log_probs = logits.log_softmax(dim = -1)
