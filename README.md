@@ -2,8 +2,6 @@
 
 Implementation of Soft Actor Critic and some of its improvements in Pytorch. Interest comes from watching <a href="https://www.youtube.com/watch?v=17NrtKHdPDw">this lecture</a>
 
-<a href="https://discord.gg/GwfjszQMMT">Temporary Discord</a>
-
 ## Citations
 
 ```bibtex
