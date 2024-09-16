@@ -4,7 +4,7 @@ from collections import namedtuple
 import torch
 from torch import nn, einsum, Tensor
 from torch.distributions import Normal
-from torch.nn import Module, ModuleList
+from torch.nn import Module, ModuleList, Sequential
 
 from beartype import beartype
 
@@ -46,47 +46,75 @@ def gumbel_noise(t):
 def gumbel_sample(t, temperature = 1., dim = -1):
     return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
 
+# helper classes
+
+def Sequential(*modules):
+    return nn.Sequential(*filter(exists, modules))
+
+class Residual(Module):
+    def __init__(self, fn: Module):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) + x
+
 # mlp
 
-@beartype
-def MLP(
-    dim,
-    dim_out,
-    dim_hiddens: int | tuple[int, ...],
-    layernorm = False,
-    dropout = 0.,
-    activation = nn.ReLU
-):
-    """
-    simple mlp for Q and value networks
+class MLP(Module):
+    @beartype
+    def __init__(
+        self,
+        dim,
+        dim_out,
+        dim_hiddens: int | tuple[int, ...],
+        layernorm = False,
+        dropout = 0.,
+        activation = nn.ReLU,
+        add_residual = False
+    ):
+        super().__init__()
+        """
+        simple mlp for Q and value networks
 
-    following Figure 1 in https://arxiv.org/pdf/2110.02034.pdf for placement of dropouts and layernorm
-    however, be aware that Levine in his lecture has ablations that show layernorm alone (without dropout) is sufficient for regularization
-    """
+        following Figure 1 in https://arxiv.org/pdf/2110.02034.pdf for placement of dropouts and layernorm
+        however, be aware that Levine in his lecture has ablations that show layernorm alone (without dropout) is sufficient for regularization
+        """
 
-    dim_hiddens = cast_tuple(dim_hiddens)
+        dim_hiddens = cast_tuple(dim_hiddens)
 
-    layers = []
+        layers = []
 
-    curr_dim = dim
+        curr_dim = dim
 
-    for dim_hidden in dim_hiddens:
-        layers.append(nn.Linear(curr_dim, dim_hidden))
+        for dim_hidden in dim_hiddens:
 
-        layers.append(nn.Dropout(dropout))
+            layer = Sequential(
+                nn.Linear(curr_dim, dim_hidden),
+                nn.Dropout(dropout),
+                nn.LayerNorm(dim_hidden) if layernorm else None,
+                activation()
+            )
 
-        if layernorm:
-            layers.append(nn.LayerNorm(dim_hidden))
+            if add_residual:
+                layer = Residual(layer)
 
-        layers.append(activation())
+            layers.append(layer)
 
-        curr_dim = dim_hidden
+            curr_dim = dim_hidden
 
-    # final layer out
+        # final layer out
 
-    layers.append(nn.Linear(curr_dim, dim_out))
+        layers.append(nn.Linear(curr_dim, dim_out))
 
-    return nn.Sequential(*layers)
+        self.layers = ModuleList(layers)
+
+    def forward(self, x):
+
+        for layer in self.layers:
+            x = layer(x)
+
+        return x
 
 # main modules
 
