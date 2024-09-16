@@ -252,7 +252,7 @@ class MultipleCritics(Module):
         values = [critic(states, actions) for critic in self.critics]
 
         if not exists(target):
-            # double critic trick (todo: find paper and read it) for treating overestimation bias
+            # double critic trick (todo: find paper, read it, and figure out if there is a new sota for this issue) for treating overestimation bias
             min_critic_value = torch.minimum(*values)
 
             return min_critic_value, values
