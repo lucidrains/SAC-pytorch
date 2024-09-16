@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import torch
 from torch import nn, einsum, Tensor
 from torch.nn import Module, ModuleList
 
 from beartype import beartype
-from beartype.typing import Tuple, List, Optional, Union
 
 # ein notations
 
@@ -28,7 +29,7 @@ def cast_tuple(t, length = 1):
 def MLP(
     dim,
     dim_out,
-    dim_hiddens: Union[int, Tuple[int, ...]],
+    dim_hiddens: int | tuple[int, ...],
     layernorm = False,
     dropout = 0.,
     activation = nn.ReLU
@@ -67,12 +68,13 @@ def MLP(
 # main modules
 
 class Actor(Module):
+    @beartype
     def __init__(
         self,
         *,
         dim_state,
         num_cont_actions,
-        dim_hiddens: Tuple[int, ...] = tuple(),
+        dim_hiddens: tuple[int, ...] = (),
         eps = 1e-5
     ):
         super().__init__()
@@ -112,7 +114,7 @@ class Critic(Module):
         *,
         dim_state,
         num_continuous_actions,
-        dim_hiddens: Tuple[int, ...] = tuple(),
+        dim_hiddens: tuple[int, ...] = (),
         layernorm = False,
         dropout = 0.
     ):
@@ -144,7 +146,7 @@ class ValueNetwork(Module):
         self,
         *,
         dim_state,
-        dim_hiddens: Tuple[int, ...] = tuple()
+        dim_hiddens: tuple[int, ...] = ()
     ):
         super().__init__()
 
@@ -165,6 +167,7 @@ class ValueNetwork(Module):
 # main class
 
 class SAC(Module):
+    @beartype
     def __init__(
         self
     ):
