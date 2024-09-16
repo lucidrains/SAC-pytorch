@@ -3,6 +3,7 @@ from collections import namedtuple
 
 import torch
 from torch import nn, einsum, Tensor
+from torch.distributions import Normal
 from torch.nn import Module, ModuleList
 
 from beartype import beartype
@@ -23,7 +24,7 @@ from ema_pytorch import EMA
 ContinuousOutput = namedtuple('ContinuousOutput', ['mu', 'sigma'])
 
 SoftActorOutput = namedtuple('SoftActorOutput', ['continuous', 'discrete'])
-SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', ['continuous', 'discrete'])
+SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', ['continuous', 'discrete', 'continuous_log_prob', 'discrete_log_prob'])
 
 # helpers
 
@@ -39,7 +40,7 @@ def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
 def gumbel_noise(t):
-    noise = torch.zeros_like(t).uniform_(0, 1)
+    noise = torch.rand_like(t)
     return -log(-log(noise))
 
 def gumbel_sample(t, temperature = 1., dim = -1):
@@ -106,6 +107,7 @@ class Actor(Module):
         discrete_action_dims = sum(num_discrete_actions)
         cont_action_dims = num_cont_actions * 2
 
+        self.num_cont_actions = num_cont_actions
         self.num_discrete_actions = num_discrete_actions
         self.split_dims = (discrete_action_dims, cont_action_dims)
 
@@ -125,7 +127,7 @@ class Actor(Module):
         action_dims = self.to_actions(state)
 
         discrete_actions, cont_actions = action_dims.split(self.split_dims, dim = -1)
-        discrete_action_logits = discrete_actions.split(self.num_discrete_actions)
+        discrete_action_logits = discrete_actions.split(self.num_discrete_actions, dim = -1)
 
         mu, sigma = rearrange(cont_actions, '... (n mu_sigma) -> mu_sigma ... n', mu_sigma = 2)
         sigma = sigma.sigmoid().clamp(min = self.eps)
@@ -136,10 +138,37 @@ class Actor(Module):
         if not sample:
             return SoftActorOutput(cont_output, discrete_output)
 
-        sampled_cont = mu + sigma * torch.randn_like(sigma)
-        sampled_discrete = [gumbel_sample(logits, temperature = discrete_sample_temperature) for logits in discrete_action_logits]
+        # handle continuous
 
-        return SampledSoftActorOutput(sampled_cont, sampled_discrete)
+        sampled_cont_actions = mu + sigma * torch.randn_like(sigma)
+        squashed_cont_actions = sampled_cont_actions.tanh() # tanh squashing
+
+        cont_log_prob = Normal(mu, sigma).log_prob(sampled_cont_actions)
+        cont_log_prob = cont_log_prob - log(1. - squashed_cont_actions ** 2, eps = self.eps)
+
+        scaled_squashed_cont_actions = squashed_cont_actions * self.num_cont_actions
+
+        # handle discrete
+
+        sampled_discrete_actions = []
+        discrete_log_probs = []
+
+        for logits in discrete_action_logits:
+            sampled_action = gumbel_sample(logits, temperature = discrete_sample_temperature)
+            sampled_discrete_actions.append(sampled_action)
+
+            log_probs = logits.log_softmax(dim = -1)
+            discrete_log_prob = get_at('... [d], ... -> ...', log_probs, sampled_action)
+            discrete_log_probs.append(discrete_log_prob)
+
+        # return all sampled continuous and discrete actions with their associated log prob
+
+        return SampledSoftActorOutput(
+            scaled_squashed_cont_actions,
+            sampled_discrete_actions,
+            cont_log_prob,
+            discrete_log_probs
+        )
 
 class Critic(Module):
     @beartype
