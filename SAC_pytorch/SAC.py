@@ -369,6 +369,10 @@ class LearnedEntropyTemperature(Module):
         self.discrete_entropy_target = 0.98 * math.log(num_discrete_actions)
         self.continuous_entropy_target = num_cont_actions
 
+    @property
+    def alpha(self):
+        return self.log_alpha.exp()
+
     def forward(
         self,
         cont_log_prob = None,
@@ -376,7 +380,7 @@ class LearnedEntropyTemperature(Module):
     ):
         assert exists(cont_log_prob) or exists(discrete_log_prob)
 
-        alpha = self.log_alpha.exp()
+        alpha = self.alpha
 
         losses = []
 
