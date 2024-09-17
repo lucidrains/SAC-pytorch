@@ -221,10 +221,11 @@ class Critic(Module):
         dim_hiddens: tuple[int, ...] = (),
         layernorm = False,
         dropout = 0.,
-        num_quantiles: int | None = None
+        num_quantiles: int | None = None,
+        quantiles: tuple[float, ...] | None = None
     ):
         super().__init__()
-        assert not exists(num_quantiles) or num_quantiles > 1
+        assert not exists(num_quantiles) or num_quantiles > 0
 
         self.returning_quantiles = exists(num_quantiles)
         self.num_quantiles = num_quantiles
@@ -239,7 +240,11 @@ class Critic(Module):
 
         # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
 
-        quantiles = torch.linspace(0., 1., num_quantiles + 2)
+        if exists(quantiles):
+            quantiles = torch.tensor(quantiles)
+        else:
+            quantiles = torch.linspace(0., 1., num_quantiles + 2)[1:-1]
+
         self.register_buffer('quantiles', quantiles)
 
     def forward(
