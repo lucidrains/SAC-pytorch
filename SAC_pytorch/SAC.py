@@ -27,6 +27,7 @@ Bool  = TorchTyping(jaxtyping.Bool)
 # ein notations
 # b - batch
 # n - number of actions
+# c - critics
 # q - quantiles
 
 from einx import get_at
