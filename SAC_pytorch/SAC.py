@@ -10,11 +10,24 @@ from torch.nn import Module, ModuleList, Sequential
 
 # tensor typing
 
+import jaxtyping
 from beartype import beartype
+
+class TorchTyping:
+    def __init__(self, abstract_dtype):
+        self.abstract_dtype = abstract_dtype
+
+    def __getitem__(self, shapes: str):
+        return self.abstract_dtype[Tensor, shapes]
+
+Float = TorchTyping(jaxtyping.Float)
+Int   = TorchTyping(jaxtyping.Int)
+Bool  = TorchTyping(jaxtyping.Bool)
 
 # ein notations
 # b - batch
 # n - number of actions
+# q - quantiles
 
 from einx import get_at
 from einops import rearrange, repeat, reduce, pack, unpack
@@ -61,7 +74,11 @@ def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
 
 class Residual(Module):
-    def __init__(self, fn: Module):
+    @beartype
+    def __init__(
+        self,
+        fn: Module
+    ):
         super().__init__()
         self.fn = fn
 
@@ -157,11 +174,15 @@ class Actor(Module):
 
     def forward(
         self,
-        state,
+        state: Float['b ...'],
         sample = False,
         discrete_sample_temperature = 1.,
         discrete_sample_deterministic = False
+    ) -> (
+        SoftActorOutput |
+        SampledSoftActorOutput
     ):
+
         action_dims = self.to_actions(state)
 
         discrete_actions, cont_actions = action_dims.split(self.split_dims, dim = -1)
@@ -240,6 +261,8 @@ class Critic(Module):
             dropout = dropout
         )
 
+        self._n = num_actions
+
         # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
 
         if exists(quantiles):
@@ -251,8 +274,11 @@ class Critic(Module):
 
     def forward(
         self,
-        state,
-        cont_actions = None
+        state: Float['b ...'],
+        cont_actions: Float['b {self._n}'] | None = None
+    ) -> (
+        Float['b'] |
+        Float['b q']
     ):
         pack_input = compact([state, cont_actions])
 
@@ -280,9 +306,9 @@ class MultipleCritics(Module):
 
     def forward(
         self,
-        states,
-        cont_actions = None,
-        target_value = None,
+        states: Float['b ...'],
+        cont_actions: Float['b n'] | None = None,
+        target_value: Float['b'] | None = None,
     ):
         values = [critic(states, cont_actions) for critic in self.critics], 'this wrapper only allows for non-quantile critics'
 
@@ -291,7 +317,7 @@ class MultipleCritics(Module):
             return min_critic_value, values
 
         losses = [F.mse_loss(values, target) for value in values]
-        return losses
+        return sum(losses), losses
 
 class MultipleQuantileCritics(Module):
     @beartype
@@ -320,9 +346,9 @@ class MultipleQuantileCritics(Module):
 
     def forward(
         self,
-        states,
-        cont_actions = None,
-        target_value = None,
+        states: Float['b ...'],
+        cont_actions: Float['b n'] | None = None,
+        target_value: Float['b q'] | None = None,
     ):
         quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
 
@@ -375,8 +401,8 @@ class LearnedEntropyTemperature(Module):
 
     def forward(
         self,
-        cont_log_prob = None,
-        discrete_log_prob = None
+        cont_log_prob: Float['b n'] | None = None,
+        discrete_log_prob: Float['b n'] | None = None
     ):
         assert exists(cont_log_prob) or exists(discrete_log_prob)
 

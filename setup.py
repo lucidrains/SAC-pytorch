@@ -22,6 +22,7 @@ setup(
     'einops>=0.7.0',
     'einx[torch]>=0.1.3',
     'ema-pytorch>=0.6.2',
+    'jaxtyping',
     'pytorch-custom-utils>=0.0.18',
     'soft-moe-pytorch>=0.1.6',
     'torch>=2.0'
