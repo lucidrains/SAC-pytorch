@@ -1,8 +1,10 @@
 from __future__ import annotations
+
+import math
 from collections import namedtuple
 
 import torch
-from torch import nn, einsum, Tensor
+from torch import nn, einsum, Tensor, tensor
 from torch.distributions import Normal
 from torch.nn import Module, ModuleList, Sequential
 
@@ -241,7 +243,7 @@ class Critic(Module):
         # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
 
         if exists(quantiles):
-            quantiles = torch.tensor(quantiles)
+            quantiles = tensor(quantiles)
         else:
             quantiles = torch.linspace(0., 1., num_quantiles + 2)[1:-1]
 
@@ -347,6 +349,48 @@ class MultipleQuantileCritics(Module):
 
         losses = reduce(losses, '... q -> ...', 'sum')
         return losses.mean()
+
+# automatic entropy temperature adjustment
+# will account for both continuous and discrete
+
+class LearnedEntropyTemperature(Module):
+    def __init__(
+        self,
+        num_discrete_actions = 0,
+        num_cont_action = 0
+    ):
+        super().__init__()
+
+        self.log_alpha = nn.Parameter(tensor(0.))
+
+        self.has_discrete = num_discrete_actions > 0
+        self.has_continuous = num_cont_actions > 0
+
+        self.discrete_entropy_target = 0.98 * math.log(num_discrete_actions)
+        self.continuous_entropy_target = num_cont_actions
+
+    def forward(
+        self,
+        cont_log_prob = None,
+        discrete_log_prob = None
+    ):
+        assert exists(cont_log_prob) or exists(discrete_log_prob)
+
+        alpha = self.log_alpha.exp()
+
+        losses = []
+
+        if exists(discrete_log_prob):
+            discrete_entropy_temp_loss = -alpha * (discrete_log_prob + self.discrete_entropy_target).detach()
+
+            losses.append(discrete_entropy_temp_loss)
+
+        if exists(cont_log_prob):
+            cont_entropy_temp_loss = -alpha * (cont_log_prob + self.continuous_entropy_target).detach()
+
+            losses.append(cont_entropy_temp_loss)
+
+        return sum(losses).mean()
 
 # main class
 
