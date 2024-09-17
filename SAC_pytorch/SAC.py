@@ -265,6 +265,10 @@ class MultipleCritics(Module):
         *critics: Critic
     ):
         super().__init__()
+        assert len(critics) > 0
+        assert all([not critic.returning_quantiles for critic in critics])
+
+        self.num_critics = len(critics)
         self.critics = ModuleList(critics)
 
     def forward(
@@ -273,16 +277,71 @@ class MultipleCritics(Module):
         cont_actions = None,
         target_value = None,
     ):
-        values = [critic(states, cont_actions) for critic in self.critics]
+        values = [critic(states, cont_actions) for critic in self.critics], 'this wrapper only allows for non-quantile critics'
 
         if not exists(target_value):
-            # double critic trick (todo: find paper and read it) for treating overestimation bias
             min_critic_value = torch.minimum(*values)
-
             return min_critic_value, values
 
         losses = [F.mse_loss(values, target) for value in values]
         return losses
+
+class MultipleQuantileCritics(Module):
+    @beartype
+    def __init__(
+        self,
+        *critics: Critic,
+        frac_atom_keep = 0.75 # will truncate 25% of the top values
+    ):
+        super().__init__()
+        assert len(critics) > 0
+        assert all([critic.returning_quantiles for critic in critics]), 'all critics must be returning quantiles'
+        assert len(set([critic.num_quantiles for critic in critics])) == 1, 'all critics must have same number of quantiles'
+
+        self.num_critics = len(critics)
+
+        self.critics = ModuleList(critics)
+        self.num_atom_keep = frac_atom_keep * self.num_critics * self.num_quantiles
+
+    @property
+    def quantiles(self):
+        return self.critics[0].quantiles
+
+    @property
+    def num_quantiles(self):
+        return self.critics[0].num_quantiles
+
+    def forward(
+        self,
+        states,
+        cont_actions = None,
+        target_value = None,
+    ):
+        quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
+
+        if not exists(target_value):
+            quantile_atoms = rearrange(quantile_atoms, 'c b ... q -> b ... (q c)')
+
+            # mean of the truncated distribution
+
+            truncated_quantiles = quantile_atoms.topk(self.num_atom_keep, largest = False).values
+            truncated_mean = truncated_quantiles.mean()
+
+            return truncated_mean, quantile_atoms
+
+        # quantile regression if training
+
+        target_value = torch.stack(target_value)
+        quantile_atoms = torch.stack(quantile_atoms)
+        quantiles = self.quantiles
+
+        # quantile regression loss
+
+        error = target_value - quantile_atoms
+        losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
+
+        losses = reduce(losses, '... q -> ...', 'sum')
+        return losses.mean()
 
 # main class
 
