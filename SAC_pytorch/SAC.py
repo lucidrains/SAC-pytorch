@@ -6,6 +6,8 @@ from torch import nn, einsum, Tensor
 from torch.distributions import Normal
 from torch.nn import Module, ModuleList, Sequential
 
+# tensor typing
+
 from beartype import beartype
 
 # ein notations
@@ -218,20 +220,27 @@ class Critic(Module):
         num_actions,
         dim_hiddens: tuple[int, ...] = (),
         layernorm = False,
-        dropout = 0.
+        dropout = 0.,
+        num_quantiles: int | None = None
     ):
         super().__init__()
+        assert not exists(num_quantiles) or num_quantiles > 1
 
-        self.to_q = Sequential(
-            MLP(
-                dim_state + num_actions,
-                dim_out = 1,
-                dim_hiddens = dim_hiddens,
-                layernorm = layernorm,
-                dropout = dropout
-            ),
-            Rearrange('... 1 -> ...')
+        self.returning_quantiles = exists(num_quantiles)
+        self.num_quantiles = num_quantiles
+
+        self.to_values = MLP(
+            dim_state + num_actions,
+            dim_out = 1 if not self.returning_quantiles else num_quantiles,
+            dim_hiddens = dim_hiddens,
+            layernorm = layernorm,
+            dropout = dropout
         )
+
+        # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
+
+        quantiles = torch.linspace(0., 1., num_quantiles + 2)
+        self.register_buffer('quantiles', quantiles)
 
     def forward(
         self,
@@ -240,11 +249,14 @@ class Critic(Module):
     ):
         pack_input = compact([state, cont_actions])
 
-        mlp_input, _ = pack([state, cont_actions], 'b *')
+        mlp_input, _ = pack(pack_input, 'b *')
 
-        q_values = self.to_q(mlp_input)
+        values = self.to_values(mlp_input)
 
-        return q_values
+        if self.returning_quantiles:
+            return values
+
+        return rearrange(values, '... 1 -> ...')
 
 class MultipleCritics(Module):
     @beartype

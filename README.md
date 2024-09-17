@@ -43,3 +43,13 @@ Implementation of Soft Actor Critic and some of its improvements in Pytorch. Int
     url     = {https://api.semanticscholar.org/CorpusID:261076021}
 }
 ```
+
+```bibtex
+@inproceedings{Kuznetsov2020ControllingOB,
+    title   = {Controlling Overestimation Bias with Truncated Mixture of Continuous Distributional Quantile Critics},
+    author  = {Arsenii Kuznetsov and Pavel Shvechikov and Alexander Grishin and Dmitry P. Vetrov},
+    booktitle = {International Conference on Machine Learning},
+    year    = {2020},
+    url     = {https://api.semanticscholar.org/CorpusID:218581840}
+}
+```
