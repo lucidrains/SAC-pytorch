@@ -268,7 +268,7 @@ class Critic(Module):
 
         if exists(quantiles):
             quantiles = tensor(quantiles)
-        else:
+        elif exists(num_quantiles):
             quantiles = torch.linspace(0., 1., num_quantiles + 2)[1:-1]
 
         self.register_buffer('quantiles', quantiles)
@@ -296,14 +296,17 @@ class MultipleCritics(Module):
     @beartype
     def __init__(
         self,
-        *critics: Critic
+        *critics: Critic,
+        use_softmin = False
     ):
         super().__init__()
         assert len(critics) > 0
-        assert all([not critic.returning_quantiles for critic in critics])
+        assert all([not critic.returning_quantiles for critic in critics]), 'this wrapper only allows for non-quantile critics'
 
         self.num_critics = len(critics)
         self.critics = ModuleList(critics)
+
+        self.use_softmin = use_softmin
 
     def forward(
         self,
@@ -311,10 +314,18 @@ class MultipleCritics(Module):
         cont_actions: Float['b n'] | None = None,
         target_value: Float['b'] | None = None,
     ):
-        values = [critic(states, cont_actions) for critic in self.critics], 'this wrapper only allows for non-quantile critics'
+        values = [critic(states, cont_actions) for critic in self.critics]
 
         if not exists(target_value):
-            min_critic_value = torch.minimum(*values)
+
+            if self.use_softmin:
+                values = torch.stack(values, dim = -1)
+                softmin = (-values).softmax(dim = -1)
+
+                min_critic_value = (softmin * values).sum(dim = -1)
+            else:
+                min_critic_value = torch.minimum(*values)
+
             return min_critic_value, values
 
         losses = [F.mse_loss(values, target) for value in values]
