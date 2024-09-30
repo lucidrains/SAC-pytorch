@@ -81,13 +81,16 @@ class Residual(Module):
     @beartype
     def __init__(
         self,
-        fn: Module
+        fn: Module,
+        dim_in,
+        dim_out
     ):
         super().__init__()
         self.fn = fn
+        self.residual_proj = nn.Linear(dim_in, dim_out) if dim_in != dim_out else identity
 
     def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) + x
+        return self.fn(x, **kwargs) + self.residual_proj(x)
 
 class NegativeConcat(Module):
     """
@@ -119,7 +122,7 @@ class MLP(Module):
         activation = nn.ReLU,
         negative_concat = True,
         expansion_factor = 2,
-        add_residual = False
+        add_residual = True
     ):
         super().__init__()
         """
@@ -150,7 +153,7 @@ class MLP(Module):
             )
 
             if add_residual:
-                layer = Residual(layer)
+                layer = Residual(layer, curr_dim, dim_hidden)
 
             layers.append(layer)
 
