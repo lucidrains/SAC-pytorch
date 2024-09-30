@@ -53,3 +53,25 @@ Implementation of Soft Actor Critic and some of its improvements in Pytorch. Int
     url     = {https://api.semanticscholar.org/CorpusID:218581840}
 }
 ```
+
+```bibtex
+@article{Zagoruyko2017DiracNetsTV,
+    title   = {DiracNets: Training Very Deep Neural Networks Without Skip-Connections},
+    author={Sergey Zagoruyko and Nikos Komodakis},
+    journal = {ArXiv},
+    year    = {2017},
+    volume  = {abs/1706.00388},
+    url     = {https://api.semanticscholar.org/CorpusID:1086822}
+}
+```
+
+```bibtex
+@article{Abbas2023LossOP,
+    title  = {Loss of Plasticity in Continual Deep Reinforcement Learning},
+    author = {Zaheer Abbas and Rosie Zhao and Joseph Modayil and Adam White and Marlos C. Machado},
+    journal = {ArXiv},
+    year    = {2023},
+    volume  = {abs/2303.07507},
+    url     = {https://api.semanticscholar.org/CorpusID:257504763}
+}
+```
