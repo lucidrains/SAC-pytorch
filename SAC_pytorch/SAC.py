@@ -506,6 +506,7 @@ class SAC(Module):
         reward_discount_rate = 0.99,
         reward_scale = 1.,
         actor_learning_rate = 3e-4,
+        actor_regen_reg_rate = 1e-4,
         critic_target_ema_decay = 0.99,
         critics_learning_rate = 3e-4,
         critics_regen_reg_rate = 1e-4,
@@ -523,7 +524,8 @@ class SAC(Module):
 
         self.actor_optimizer = Adam(
             actor.parameters(),
-            lr = actor_learning_rate
+            lr = actor_learning_rate,
+            regen_reg_rate = actor_regen_reg_rate
         )
         # based on the actor hyperparameters, init the leraned temperature container
 
