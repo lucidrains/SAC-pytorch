@@ -46,7 +46,7 @@ from ema_pytorch import EMA
 ContinuousOutput = namedtuple('ContinuousOutput', ['mu', 'sigma'])
 
 SoftActorOutput = namedtuple('SoftActorOutput', ['continuous', 'discrete'])
-SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', ['continuous', 'discrete', 'continuous_log_prob', 'discrete_log_prob'])
+SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', ['continuous', 'discrete', 'continuous_log_prob', 'discrete_log_probs', 'discrete_entropy'])
 
 # helpers
 
@@ -66,6 +66,10 @@ def cast_tuple(t, length = 1):
 
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
+
+def entropy(t, eps = 1e-20):
+    prob = t.softmax(dim = -1)
+    return (-prob * log(prob, eps = eps)).sum(dim = -1)
 
 def gumbel_noise(t):
     noise = torch.rand_like(t)
@@ -227,7 +231,8 @@ class Actor(Module):
         sample = False,
         cont_reparametrize = False,
         discrete_sample_temperature = 1.,
-        discrete_sample_deterministic = False
+        discrete_sample_deterministic = False,
+        return_discrete_entropies = False
     ) -> (
         SoftActorOutput |
         SampledSoftActorOutput
@@ -261,6 +266,12 @@ class Actor(Module):
 
         scaled_squashed_cont_actions = squashed_cont_actions * self.num_cont_actions
 
+        # handle maybe discrete entropy
+
+        discrete_entropies = None
+        if return_discrete_entropies:
+            discrete_entropies = [entropy(logits) for logits in discrete_action_logits]
+
         # handle discrete
 
         sampled_discrete_actions = []
@@ -285,7 +296,8 @@ class Actor(Module):
             scaled_squashed_cont_actions,
             sampled_discrete_actions,
             cont_log_prob,
-            discrete_log_probs
+            discrete_log_probs,
+            discrete_entropies
         )
 
 class Critic(Module):
@@ -598,10 +610,13 @@ class SAC(Module):
 
             next_q_value = self.critics_target(next_states, cont_actions = cont_actions)
 
-            actor_output = self.actor(states, sample = True, cont_reparametrize = True)
+            actor_output = self.actor(states, sample = True, cont_reparametrize = True, return_discrete_entropies = True)
             learned_entropy_weight = self.learned_entropy_temperature.alpha
 
-            next_soft_state_value = next_q_value - learned_entropy_weight * actor_output.continuous_log_prob
+            cont_entropy = -actor_output.continuous_log_prob
+            discrete_entropies = actor_output.discrete_entropies
+
+            next_soft_state_value = next_q_value + learned_entropy_weight * (cont_entropy + sum(discrete_entropies))
 
         q_value = rewards + not_terminal * γ * next_soft_state_value
 
