@@ -8,6 +8,8 @@ from torch import nn, einsum, Tensor, tensor
 from torch.distributions import Normal
 from torch.nn import Module, ModuleList, Sequential
 
+from adam_atan2_pytorch import AdamAtan2
+
 # tensor typing
 
 import jaxtyping
@@ -483,6 +485,8 @@ class SAC(Module):
         reward_discount_rate = 0.99,
         reward_scale = 1.,
         critic_target_ema_decay = 0.99,
+        critics_learning_rate = 3e-4,
+        critics_regen_reg_rate = 1e-4
     ):
         super().__init__()
 
@@ -515,6 +519,14 @@ class SAC(Module):
 
         self.critics = critics
 
+        # critic optimizers
+
+        self.critics_optimizer = AdamAtan2(
+            critics,
+            lr = critics_learning_rate,
+            regen_rg_rate = critics_regen_reg_rate
+        )
+
         # target critic network
 
         self.critics_target = EMA(
@@ -530,10 +542,30 @@ class SAC(Module):
 
     def forward(
         self,
-        states,
+        states: Float['b ...'],
         actions,
-        rewards,
-        done,
-        next_states
+        rewards: Float['b'],
+        done: Bool['b'],
+        next_states: Float['b ...']
     ):
+
+        rewards = rewards * self.reward_scale
+
+        # bellman equation
+        # todo: setup n-step
+
+        γ = self.discount_factor_gamma
+        not_terminal = (~done).float()
+
+        q_value = rewards + not_terminal * γ * self.critics_target(next_states)
+        pred_q_value = self.critics(states)
+
+        critic_loss = F.mse_loss(q_value, pred_q_value)
+
+        # update the critics
+
+        critic_loss.backward()
+        self.critics_optimizer.step()
+        self.critics_optimizer.zero_grad()
+
         return 0.
