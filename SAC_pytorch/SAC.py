@@ -75,6 +75,18 @@ def gumbel_sample(t, temperature = 1., dim = -1):
     assert temperature > 0.
     return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
 
+def init_(m):
+    if not isinstance(m, nn.Linear):
+        return
+
+    gain = torch.nn.init.calculate_gain('relu')
+    torch.nn.init.orthogonal_(m.weight, gain)
+
+    if not exists(m.bias):
+        return
+
+    torch.nn.init.zeros_(m.bias)
+
 # helper classes
 
 def Sequential(*modules):
@@ -167,6 +179,10 @@ class MLP(Module):
         layers.append(nn.Linear(curr_dim, dim_out))
 
         self.layers = ModuleList(layers)
+
+        # init
+
+        self.apply(init_)
 
     def forward(self, x):
 
