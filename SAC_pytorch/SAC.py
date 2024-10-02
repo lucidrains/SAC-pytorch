@@ -486,7 +486,8 @@ class SAC(Module):
         reward_scale = 1.,
         critic_target_ema_decay = 0.99,
         critics_learning_rate = 3e-4,
-        critics_regen_reg_rate = 1e-4
+        critics_regen_reg_rate = 1e-4,
+        ema_kwargs: dict = dict()
     ):
         super().__init__()
 
@@ -522,9 +523,9 @@ class SAC(Module):
         # critic optimizers
 
         self.critics_optimizer = AdamAtan2(
-            critics,
+            critics.parameters(),
             lr = critics_learning_rate,
-            regen_rg_rate = critics_regen_reg_rate
+            regen_reg_rate = critics_regen_reg_rate
         )
 
         # target critic network
@@ -532,7 +533,8 @@ class SAC(Module):
         self.critics_target = EMA(
             critics,
             beta = critic_target_ema_decay,
-            include_online_model = False
+            include_online_model = False,
+            **ema_kwargs
         )
 
         # reward related
@@ -557,9 +559,13 @@ class SAC(Module):
         γ = self.discount_factor_gamma
         not_terminal = (~done).float()
 
-        q_value = rewards + not_terminal * γ * self.critics_target(next_states)
-        pred_q_value = self.critics(states)
+        with torch.no_grad():
+            self.critics_target.eval()
+            next_q_value = self.critics_target(next_states)
 
+        q_value = rewards + not_terminal * γ * next_q_value
+
+        pred_q_value = self.critics(states)
         critic_loss = F.mse_loss(q_value, pred_q_value)
 
         # update the critics
@@ -567,5 +573,10 @@ class SAC(Module):
         critic_loss.backward()
         self.critics_optimizer.step()
         self.critics_optimizer.zero_grad()
+
+
+        # update ema of all critics
+
+        self.critics_target.update()
 
         return 0.
