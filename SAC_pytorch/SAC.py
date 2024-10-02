@@ -8,7 +8,7 @@ from torch import nn, einsum, Tensor, tensor
 from torch.distributions import Normal
 from torch.nn import Module, ModuleList, Sequential
 
-from adam_atan2_pytorch import AdamAtan2
+from adam_atan2_pytorch import AdamAtan2 as Adam
 
 # tensor typing
 
@@ -505,9 +505,11 @@ class SAC(Module):
         quantiled_critics = False,
         reward_discount_rate = 0.99,
         reward_scale = 1.,
+        actor_learning_rate = 3e-4,
         critic_target_ema_decay = 0.99,
         critics_learning_rate = 3e-4,
         critics_regen_reg_rate = 1e-4,
+        temperature_learning_rate = 3e-4,
         ema_kwargs: dict = dict()
     ):
         super().__init__()
@@ -519,11 +521,20 @@ class SAC(Module):
 
         self.actor = actor
 
+        self.actor_optimizer = Adam(
+            actor.parameters(),
+            lr = actor_learning_rate
+        )
         # based on the actor hyperparameters, init the leraned temperature container
 
         self.learned_entropy_temperature = LearnedEntropyTemperature(
             num_cont_actions = actor.num_cont_actions,
             num_discrete_actions = actor.num_discrete_actions
+        )
+
+        self.temperature_optimizer = Adam(
+            self.learned_entropy_temperature.parameters(),
+            lr = temperature_learning_rate,
         )
 
         # set critics
@@ -543,7 +554,7 @@ class SAC(Module):
 
         # critic optimizers
 
-        self.critics_optimizer = AdamAtan2(
+        self.critics_optimizer = Adam(
             critics.parameters(),
             lr = critics_learning_rate,
             regen_reg_rate = critics_regen_reg_rate
@@ -607,5 +618,3 @@ class SAC(Module):
         # update ema of all critics
 
         self.critics_target.update()
-
-        return 0.
