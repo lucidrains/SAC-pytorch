@@ -225,6 +225,7 @@ class Actor(Module):
         self,
         state: Float['b ...'],
         sample = False,
+        cont_reparametrize = False,
         discrete_sample_temperature = 1.,
         discrete_sample_deterministic = False
     ) -> (
@@ -248,7 +249,11 @@ class Actor(Module):
 
         # handle continuous
 
-        sampled_cont_actions = mu + sigma * torch.randn_like(sigma)
+        if cont_reparametrize:
+            sampled_cont_actions = mu + sigma * torch.randn_like(sigma)
+        else:
+            sampled_cont_actions = torch.normal(mu, sigma)
+
         squashed_cont_actions = sampled_cont_actions.tanh() # tanh squashing
 
         cont_log_prob = Normal(mu, sigma).log_prob(sampled_cont_actions)
@@ -578,11 +583,17 @@ class SAC(Module):
         with torch.no_grad():
             self.critics_target.eval()
             next_q_value = self.critics_target(next_states, cont_actions = cont_actions)
+            sample_actor_output = self.actor(states, sample = True, cont_reparametrize = True)
 
-        q_value = rewards + not_terminal * γ * next_q_value
+            next_soft_state_value = next_q_value - sample_actor_output.continuous_log_prob
 
-        pred_q_value = self.critics(states, cont_actions = cont_actions)
-        critic_loss = F.mse_loss(q_value, pred_q_value)
+        q_value = rewards + not_terminal * γ * next_soft_state_value
+
+        pred_q_value = self.critics(
+            states,
+            cont_actions = cont_actions,
+            target_value = q_value
+        )
 
         # update the critics
 
