@@ -582,10 +582,13 @@ class SAC(Module):
 
         with torch.no_grad():
             self.critics_target.eval()
-            next_q_value = self.critics_target(next_states, cont_actions = cont_actions)
-            sample_actor_output = self.actor(states, sample = True, cont_reparametrize = True)
 
-            next_soft_state_value = next_q_value - sample_actor_output.continuous_log_prob
+            next_q_value = self.critics_target(next_states, cont_actions = cont_actions)
+
+            actor_output = self.actor(states, sample = True, cont_reparametrize = True)
+            learned_entropy_weight = self.learned_entropy_temperature.alpha
+
+            next_soft_state_value = next_q_value - learned_entropy_weight * actor_output.continuous_log_prob
 
         q_value = rewards + not_terminal * γ * next_soft_state_value
 
