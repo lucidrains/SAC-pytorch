@@ -561,7 +561,7 @@ class SAC(Module):
     def forward(
         self,
         states: Float['b ...'],
-        actions,
+        cont_actions: Float['b n'],
         rewards: Float['b'],
         done: Bool['b'],
         next_states: Float['b ...']
@@ -577,11 +577,11 @@ class SAC(Module):
 
         with torch.no_grad():
             self.critics_target.eval()
-            next_q_value = self.critics_target(next_states)
+            next_q_value = self.critics_target(next_states, cont_actions = cont_actions)
 
         q_value = rewards + not_terminal * γ * next_q_value
 
-        pred_q_value = self.critics(states)
+        pred_q_value = self.critics(states, cont_actions = cont_actions)
         critic_loss = F.mse_loss(q_value, pred_q_value)
 
         # update the critics
@@ -589,7 +589,6 @@ class SAC(Module):
         critic_loss.backward()
         self.critics_optimizer.step()
         self.critics_optimizer.zero_grad()
-
 
         # update ema of all critics
 
