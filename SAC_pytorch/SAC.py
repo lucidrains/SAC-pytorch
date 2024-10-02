@@ -12,6 +12,7 @@ from torch.nn import Module, ModuleList, Sequential
 
 import jaxtyping
 from beartype import beartype
+from beartype.door import is_bearable
 
 class TorchTyping:
     def __init__(self, abstract_dtype):
@@ -424,16 +425,16 @@ class LearnedEntropyTemperature(Module):
     def __init__(
         self,
         num_discrete_actions = 0,
-        num_cont_action = 0
+        num_cont_actions = 0
     ):
         super().__init__()
 
         self.log_alpha = nn.Parameter(tensor(0.))
 
-        self.has_discrete = num_discrete_actions > 0
+        self.has_discrete = len(num_discrete_actions) > 0
         self.has_continuous = num_cont_actions > 0
 
-        self.discrete_entropy_target = 0.98 * math.log(num_discrete_actions)
+        self.discrete_entropy_targets = [0.98 * math.log(one_num_discrete_actions)for one_num_discrete_actions in num_discrete_actions] 
         self.continuous_entropy_target = num_cont_actions
 
     @property
@@ -442,8 +443,8 @@ class LearnedEntropyTemperature(Module):
 
     def forward(
         self,
-        cont_log_prob: Float['b n'] | None = None,
-        discrete_log_prob: Float['b n'] | None = None
+        cont_log_prob: Float['b nc'] | None = None,
+        discrete_log_probs: tuple[Float['b _'], ...] | None = None
     ):
         assert exists(cont_log_prob) or exists(discrete_log_prob)
 
@@ -452,9 +453,11 @@ class LearnedEntropyTemperature(Module):
         losses = []
 
         if exists(discrete_log_prob):
-            discrete_entropy_temp_loss = -alpha * (discrete_log_prob + self.discrete_entropy_target).detach()
 
-            losses.append(discrete_entropy_temp_loss)
+            for discrete_log_prob, discrete_entropy_target in zip(discrete_log_probs, self.discrete_entropy_targets):
+                discrete_entropy_temp_loss = -alpha * (discrete_log_prob + discrete_entropy_target).detach()
+
+                losses.append(discrete_entropy_temp_loss)
 
         if exists(cont_log_prob):
             cont_entropy_temp_loss = -alpha * (cont_log_prob + self.continuous_entropy_target).detach()
@@ -468,9 +471,69 @@ class LearnedEntropyTemperature(Module):
 class SAC(Module):
     @beartype
     def __init__(
-        self
+        self,
+        actor: dict | Actor,
+        critics: (
+            list[dict] |
+            list[Critic] |
+            MultipleCritics |
+            MultipleQuantileCritics
+        ),
+        quantiled_critics = False,
+        reward_discount_rate = 0.99,
+        reward_scale = 1.,
+        critic_target_ema_decay = 0.99,
     ):
         super().__init__()
 
-    def forward(self, x):
-        return x
+        # set actor
+
+        if isinstance(actor, dict):
+            actor = Actor(**actor)
+
+        self.actor = actor
+
+        # based on the actor hyperparameters, init the leraned temperature container
+
+        self.learned_entropy_temperature = LearnedEntropyTemperature(
+            num_cont_actions = actor.num_cont_actions,
+            num_discrete_actions = actor.num_discrete_actions
+        )
+
+        # set critics
+        # allow for usual double+ critic trick or truncated quantiled critics
+
+        if is_bearable(critics, list[dict]):
+            critics = [Critic(**critic) for critic in critics]
+
+        multiple_critic_klass = MultipleCritics if not quantiled_critics else MultipleQuantileCritics
+
+        if is_bearable(critics, list[Critic]):
+            critics = multiple_critic_klass(*critics)
+
+        assert isinstance(critics, multiple_critic_klass), f'expected {multiple_critic_klass.__name__} but received critics wrapped with {type(critics).__name__}'
+
+        self.critics = critics
+
+        # target critic network
+
+        self.critics_target = EMA(
+            critics,
+            beta = critic_target_ema_decay,
+            include_online_model = False
+        )
+
+        # reward related
+
+        self.reward_scale = reward_scale
+        self.reward_discount_rate = reward_discount_rate
+
+    def forward(
+        self,
+        states,
+        actions,
+        rewards,
+        done,
+        next_states
+    ):
+        return 0.
