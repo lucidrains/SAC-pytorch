@@ -406,7 +406,8 @@ class MultipleCritics(Module):
         cont_actions: Float['b nc'] | None = None,
         discrete_actions: Int['b nd'] | None = None,
         target_values: Float['b n'] | None = None,
-        return_breakdown = False
+        return_breakdown = False,
+        **kwargs
     ):
         critics_values = [critic(states, cont_actions) for critic in self.critics]
 
@@ -699,6 +700,8 @@ class SAC(Module):
         # bellman equation
         # todo: setup n-step
 
+        entropy_temp = self.learned_entropy_temperature.alpha.detach()
+
         γ = self.reward_discount_rate
         not_terminal = (~done).float()
 
@@ -709,7 +712,7 @@ class SAC(Module):
 
             # outputs from actor
 
-            actor_output = self.actor(states, sample = True, cont_reparametrize = True)
+            actor_output = self.actor(states, sample = True)
 
             cont_log_prob = actor_output.continuous_log_prob
             discrete_logits = actor_output.discrete_action_logits
@@ -763,6 +766,39 @@ class SAC(Module):
         critics_losses.backward()
         self.critics_optimizer.step()
         self.critics_optimizer.zero_grad()
+
+        # update the actor
+
+        actor_output = self.actor(states, sample = True, cont_reparametrize = True)
+
+        cont_log_prob = actor_output.continuous_log_prob
+        discrete_logits = actor_output.discrete_action_logits
+
+        cont_q_values, *discrete_q_values = self.critics(
+            states,
+            cont_actions = actor_output.continuous,
+            discrete_actions = actor_output.discrete,
+            truncate_quantiles_across_critics = True
+        )
+
+        actor_action_losses = []
+
+        if exists(cont_log_prob):
+            cont_action_loss = (entropy_temp * cont_log_prob - cont_q_values).sum(dim = -1).mean()
+
+            actor_action_losses.append(cont_action_loss)
+
+        for discrete_logit, one_discrete_q_value in zip(discrete_logits, discrete_q_values):
+            discrete_prob = discrete_logit.softmax(dim = -1)
+            discrete_log_prob = log(discrete_prob)
+
+            one_discrete_actor_loss = (discrete_prob * (entropy_temp * discrete_log_prob - one_discrete_q_value)).mean()
+
+            actor_action_losses.append(one_discrete_actor_loss)
+
+        sum(actor_action_losses).backward()
+        self.actor_optimizer.step()
+        self.actor_optimizer.zero_grad()
 
         # update the learned entropy temperature
 
