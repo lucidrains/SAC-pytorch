@@ -4,6 +4,7 @@ import math
 from collections import namedtuple
 
 import torch
+import torch.nn.functional as F
 from torch.distributions import Normal
 from torch import nn, einsum, Tensor, tensor
 from torch.nn import Module, ModuleList, Sequential
@@ -301,8 +302,8 @@ class Actor(Module):
 
         return SampledSoftActorOutput(
             scaled_squashed_cont_actions,
+            torch.stack(sampled_discrete_actions, dim = -1),
             cont_log_prob,
-            sampled_discrete_actions,
             discrete_action_logits
         )
 
@@ -325,7 +326,6 @@ class Critic(Module):
 
         use_quantiles = exists(num_quantiles)
         self.returning_quantiles = use_quantiles
-        self.num_quantiles = num_quantiles
 
         num_actions_split = tensor((num_cont_actions, *num_discrete_actions))
 
@@ -406,31 +406,45 @@ class MultipleCritics(Module):
         cont_actions: Float['b nc'] | None = None,
         discrete_actions: Int['b nd'] | None = None,
         target_values: Float['b n'] | None = None,
+        return_breakdown = False
     ):
-        critic_values = [critic(states, cont_actions) for critic in self.critics]
+        critics_values = [critic(states, cont_actions) for critic in self.critics]
 
-        critic_values = [torch.stack(one_value_for_critics) for one_value_for_critics in zip(*critic_values)]
+        critics_values = [torch.stack(one_value_for_critics) for one_value_for_critics in zip(*critics_values)]
 
-        if not exists(target_value):
+        if not exists(target_values):
 
-            if self.use_softmin:
-                values = torch.stack(values, dim = -1)
-                softmin = (-values).softmax(dim = -1)
+            min_critic_values = []
 
-                min_critic_value = (softmin * values).sum(dim = -1)
-            else:
-                min_critic_value = torch.minimum(*values)
+            for critic_values in critics_values:
+                if self.use_softmin:
+                    values = torch.stack(values, dim = -1)
+                    softmin = (-values).softmax(dim = -1)
 
-            return min_critic_value, values
+                    min_critic_value = (softmin * critic_values).sum(dim = -1)
+                else:
+                    min_critic_value = torch.minimum(*critic_values)
 
-        cont_critic_values, *discrete_critic_values = critic_values
-        discrete_critic_values = [get_at('... [l], ... -> ...', discrete_critic_value, discrete_action) for discrete_critic_value, discrete_action in zip(discrete_critic_values, discrete_actions)]
+                min_critic_values.append(min_critic_value)
 
-        values, _ = pack(values, 'c b *')
+            if not return_breakdown:
+                return min_critic_values
 
+            return min_critic_values, values
+
+        cont_critics_values, *discrete_critics_values = critics_values
+
+        discrete_critics_values = [get_at('c b [l], b -> c b', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+
+        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b *')
+
+        target_values = repeat(target_values, '... -> c ...', c = self.num_critics)
         losses = F.mse_loss(values, target_values, reduction = 'none')
 
         reduced_losses = reduce(losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
+
+        if not return_breakdown:
+            return reduced_losses
 
         return reduced_losses, losses
 
@@ -449,7 +463,7 @@ class MultipleQuantileCritics(Module):
         self.num_critics = len(critics)
 
         self.critics = ModuleList(critics)
-        self.num_atom_keep = frac_atom_keep * self.num_critics * self.num_quantiles
+        self.num_atom_keep = int(frac_atom_keep * self.num_critics * self.num_quantiles)
 
     @property
     def quantiles(self):
@@ -465,37 +479,62 @@ class MultipleQuantileCritics(Module):
         cont_actions: Float['b nc'] | None = None,
         discrete_actions: Int['b nd'] | None = None,
         target_values: Float['b n q'] | None = None,
+        truncate_quantiles_across_critics = False,
+        return_breakdown = False
     ):
         critics_quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
 
         critics_quantile_atoms = [torch.stack(one_value_for_critics) for one_value_for_critics in zip(*critics_quantile_atoms)]
 
-        if not exists(target_value):
-            quantile_atoms = rearrange(quantile_atoms, 'c b ... q -> b ... (q c)')
+        if not exists(target_values):
 
-            # mean of the truncated distribution
+            if truncate_quantiles_across_critics:
+                truncated_means_per_action = []
 
-            truncated_quantiles = quantile_atoms.topk(self.num_atom_keep, largest = False).values
-            truncated_mean = truncated_quantiles.mean()
+                for critic_quantile_atoms in critics_quantile_atoms:
+                    quantile_atoms = rearrange(critic_quantile_atoms, 'c b ... q -> b ... (q c)')
 
-            return truncated_mean, quantile_atoms
+                    # mean of the truncated distribution
+
+                    truncated_quantiles = quantile_atoms.topk(self.num_atom_keep, largest = False).values
+                    truncated_mean = truncated_quantiles.mean(dim = -1)
+
+                    truncated_means_per_action.append(truncated_mean)
+
+                return_value = truncated_means_per_action
+            else:
+
+                min_critic_value_per_action = []
+
+                for critic_quantile_atoms in critics_quantile_atoms:
+                    min_critic_value = torch.minimum(*critic_quantile_atoms)
+                    min_critic_value_per_action.append(min_critic_value)
+
+                return_value = min_critic_value_per_action
+
+            if not return_breakdown:
+                return return_value
+
+            return return_value, critics_quantile_atoms
 
         cont_quantile_atoms, *discrete_quantile_atoms = critics_quantile_atoms
-        discrete_quantile_atoms = [get_at('... [l] q, ... -> ... q', discrete_quantile_atom, discrete_action) for discrete_quantile_atoms, discrete_action in zip(discrete_quantile_atoms, discrete_actions)]
+        discrete_quantile_atoms = [get_at('c b [l] q, b -> c b q', discrete_quantile_atom, discrete_action) for discrete_quantile_atom, discrete_action in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
 
-        quantile_atoms, _ = pack(quantile_atoms, 'c b * q')
+        quantile_atoms, _ = pack([cont_quantile_atoms, *discrete_quantile_atoms], 'c b * q')
 
         # quantile regression if training
 
-        target_value = torch.stack(target_value)
         quantiles = self.quantiles
 
         # quantile regression loss
 
-        error = target_value - quantile_atoms
+        error = target_values - quantile_atoms
         losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
 
         reduced_losses = reduce(losses, 'c b n q -> b', 'sum').mean()
+
+        if not return_breakdown:
+            return reduced_losses
 
         return reduced_losses, losses
 
@@ -651,7 +690,7 @@ class SAC(Module):
         # bellman equation
         # todo: setup n-step
 
-        γ = self.discount_factor_gamma
+        γ = self.reward_discount_rate
         not_terminal = (~done).float()
 
         with torch.no_grad():
@@ -661,16 +700,10 @@ class SAC(Module):
 
             # outputs from actor
 
-            actor_output = self.actor(states, sample = True, cont_reparametrize = True, return_discrete_entropies = True)
+            actor_output = self.actor(states, sample = True, cont_reparametrize = True)
 
             cont_log_prob = actor_output.continuous_log_prob
             discrete_logits = actor_output.discrete_action_logits
-
-            # handle extra quantile last dimension if needed
-
-            if self.quantiled_critics:
-                cont_log_prob = rearrange(cont_log_prob, '... -> ... 1')
-                discrete_logits = [rearrange(t, '... -> ... 1') for t in discrete_logits]
 
             # learned temperature
 
@@ -681,8 +714,10 @@ class SAC(Module):
             # first handle continuous soft state value
 
             if exists(cont_log_prob):
+                if self.quantiled_critics:
+                    cont_log_prob = rearrange(cont_log_prob, '... -> ... 1')
+    
                 cont_soft_state_value = next_cont_q_value - learned_entropy_weight * cont_log_prob
-
                 next_soft_state_values.append(cont_soft_state_value)
 
             # then handle discrete contribution
@@ -690,14 +725,20 @@ class SAC(Module):
             if len(next_discrete_q_values) > 0:
 
                 for next_discrete_q_value, discrete_logit in zip(next_discrete_q_values, discrete_logits):
-                    discrete_prob = discrete_logits.softmax(dim = -1)
-                    discrete_logprob = log(discrete_prob)
+                    discrete_prob = discrete_logit.softmax(dim = -1)
+                    discrete_log_prob = log(discrete_prob)
 
-                    discrete_soft_state_value = (discrete_prob * (next_discrete_q_value - learned_entropy_weight * discrete_log_prob)).sum(dim = -1)
+                    if self.quantiled_critics:
+                        discrete_prob = rearrange(discrete_prob, '... -> ... 1')
+                        discrete_log_prob = rearrange(discrete_log_prob, '... -> ... 1')
 
+                    discrete_soft_state_value = (discrete_prob * (next_discrete_q_value - learned_entropy_weight * discrete_log_prob)).sum(dim = 1)
                     next_soft_state_values.append(discrete_soft_state_value)
 
-        next_soft_state_values: Float['b n ...'] = torch.stack(next_soft_state_values, dim = 1)
+        if self.quantiled_critics:
+            next_soft_state_values, _ = pack(next_soft_state_values, 'b * q')
+        else:
+            next_soft_state_values, _ = pack(next_soft_state_values, 'b *')
 
         target_q_values = rewards + not_terminal * γ * next_soft_state_values
 
