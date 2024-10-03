@@ -380,9 +380,9 @@ class Critic(Module):
 
         split_dim = -2 if self.returning_quantiles else -1
 
-        cont_values, *discrete_values = values.split(self.num_actions_split, dim = split_dim)
+        values = values.split(self.num_actions_split, dim = split_dim)
 
-        return cont_values, tuple(discrete_values)
+        return values
 
 class MultipleCritics(Module):
     @beartype
@@ -403,10 +403,13 @@ class MultipleCritics(Module):
     def forward(
         self,
         states: Float['b ...'],
-        cont_actions: Float['b n'] | None = None,
-        target_value: Float['b'] | None = None,
+        cont_actions: Float['b nc'] | None = None,
+        discrete_actions: Int['b nd'] | None = None,
+        target_values: Float['b n'] | None = None,
     ):
-        values = [critic(states, cont_actions) for critic in self.critics]
+        critic_values = [critic(states, cont_actions) for critic in self.critics]
+
+        critic_values = [torch.stack(one_value_for_critics) for one_value_for_critics in zip(*critic_values)]
 
         if not exists(target_value):
 
@@ -420,8 +423,16 @@ class MultipleCritics(Module):
 
             return min_critic_value, values
 
-        losses = [F.mse_loss(values, target) for value in values]
-        return sum(losses), losses
+        cont_critic_values, *discrete_critic_values = critic_values
+        discrete_critic_values = [get_at('... [l], ... -> ...', discrete_critic_value, discrete_action) for discrete_critic_value, discrete_action in zip(discrete_critic_values, discrete_actions)]
+
+        values, _ = pack(values, 'c b *')
+
+        losses = F.mse_loss(values, target_values, reduction = 'none')
+
+        reduced_losses = reduce(losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
+
+        return reduced_losses, losses
 
 class MultipleQuantileCritics(Module):
     @beartype
@@ -451,10 +462,13 @@ class MultipleQuantileCritics(Module):
     def forward(
         self,
         states: Float['b ...'],
-        cont_actions: Float['b n'] | None = None,
-        target_value: Float['b q'] | None = None,
+        cont_actions: Float['b nc'] | None = None,
+        discrete_actions: Int['b nd'] | None = None,
+        target_values: Float['b n q'] | None = None,
     ):
-        quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
+        critics_quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
+
+        critics_quantile_atoms = [torch.stack(one_value_for_critics) for one_value_for_critics in zip(*critics_quantile_atoms)]
 
         if not exists(target_value):
             quantile_atoms = rearrange(quantile_atoms, 'c b ... q -> b ... (q c)')
@@ -466,10 +480,14 @@ class MultipleQuantileCritics(Module):
 
             return truncated_mean, quantile_atoms
 
+        cont_quantile_atoms, *discrete_quantile_atoms = critics_quantile_atoms
+        discrete_quantile_atoms = [get_at('... [l] q, ... -> ... q', discrete_quantile_atom, discrete_action) for discrete_quantile_atoms, discrete_action in zip(discrete_quantile_atoms, discrete_actions)]
+
+        quantile_atoms, _ = pack(quantile_atoms, 'c b * q')
+
         # quantile regression if training
 
         target_value = torch.stack(target_value)
-        quantile_atoms = torch.stack(quantile_atoms)
         quantiles = self.quantiles
 
         # quantile regression loss
@@ -477,8 +495,9 @@ class MultipleQuantileCritics(Module):
         error = target_value - quantile_atoms
         losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
 
-        losses = reduce(losses, '... q -> ...', 'sum')
-        return losses.mean()
+        reduced_losses = reduce(losses, 'c b n q -> b', 'sum').mean()
+
+        return reduced_losses, losses
 
 # automatic entropy temperature adjustment
 # will account for both continuous and discrete
@@ -638,7 +657,7 @@ class SAC(Module):
         with torch.no_grad():
             self.critics_target.eval()
 
-            next_cont_q_value, next_discrete_q_values = self.critics_target(next_states, cont_actions = cont_actions)
+            next_cont_q_value, *next_discrete_q_values = self.critics_target(next_states, cont_actions = cont_actions)
 
             # outputs from actor
 
@@ -651,7 +670,7 @@ class SAC(Module):
 
             if self.quantiled_critics:
                 cont_log_prob = rearrange(cont_log_prob, '... -> ... 1')
-                discrete_logits = [rearrange(t, '... -> ... 1'), for t in discrete_logits]
+                discrete_logits = [rearrange(t, '... -> ... 1') for t in discrete_logits]
 
             # learned temperature
 
@@ -678,17 +697,20 @@ class SAC(Module):
 
                     next_soft_state_values.append(discrete_soft_state_value)
 
-        target_q_values = [(rewards + not_terminal * γ * soft_state_value) for soft_state_value in next_soft_state_values]
+        next_soft_state_values: Float['b n ...'] = torch.stack(next_soft_state_values, dim = 1)
 
-        pred_q_value = self.critics(
+        target_q_values = rewards + not_terminal * γ * next_soft_state_values
+
+        critics_losses = self.critics(
             states,
             cont_actions = cont_actions,
+            discrete_actions = discrete_actions,
             target_values = target_q_values
         )
 
         # update the critics
 
-        critic_loss.backward()
+        critics_losses.backward()
         self.critics_optimizer.step()
         self.critics_optimizer.zero_grad()
 
