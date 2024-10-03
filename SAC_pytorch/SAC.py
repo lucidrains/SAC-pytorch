@@ -564,7 +564,8 @@ class LearnedEntropyTemperature(Module):
     def forward(
         self,
         cont_log_prob: Float['b nc'] | None = None,
-        discrete_log_probs: tuple[Float['b _'], ...] | None = None
+        discrete_logits: tuple[Float['b _'], ...] | None = None,
+        return_breakdown = False
     ):
         assert exists(cont_log_prob) or exists(discrete_log_prob)
 
@@ -572,19 +573,27 @@ class LearnedEntropyTemperature(Module):
 
         losses = []
 
-        if exists(discrete_log_prob):
+        if exists(discrete_logits):
 
-            for discrete_log_prob, discrete_entropy_target in zip(discrete_log_probs, self.discrete_entropy_targets):
+            for one_discrete_logits, discrete_entropy_target in zip(discrete_logits, self.discrete_entropy_targets):
+                discrete_log_prob = one_discrete_logits.log_softmax(dim = -1)
                 discrete_entropy_temp_loss = -alpha * (discrete_log_prob + discrete_entropy_target).detach()
 
-                losses.append(discrete_entropy_temp_loss)
+                losses.append(discrete_entropy_temp_loss.mean())
 
         if exists(cont_log_prob):
             cont_entropy_temp_loss = -alpha * (cont_log_prob + self.continuous_entropy_target).detach()
 
+            cont_entropy_temp_loss = cont_entropy_temp_loss.mean(dim = 0)
             losses.append(cont_entropy_temp_loss)
 
-        return sum(losses).mean()
+        reduced_losses, _ = pack(losses, '*')
+        reduced_losses = reduced_losses.sum()
+
+        if not return_breakdown:
+            return reduced_losses
+
+        return reduced_losses, losses
 
 # main class
 
@@ -754,6 +763,17 @@ class SAC(Module):
         critics_losses.backward()
         self.critics_optimizer.step()
         self.critics_optimizer.zero_grad()
+
+        # update the learned entropy temperature
+
+        temperature_loss = self.learned_entropy_temperature(
+            cont_log_prob = cont_log_prob,
+            discrete_logits = discrete_logits
+        )
+
+        temperature_loss.backward()
+        self.temperature_optimizer.step()
+        self.temperature_optimizer.zero_grad()
 
         # update ema of all critics
 
