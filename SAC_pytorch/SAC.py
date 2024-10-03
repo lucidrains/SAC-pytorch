@@ -4,8 +4,8 @@ import math
 from collections import namedtuple
 
 import torch
-from torch import nn, einsum, Tensor, tensor
 from torch.distributions import Normal
+from torch import nn, einsum, Tensor, tensor
 from torch.nn import Module, ModuleList, Sequential
 
 from adam_atan2_pytorch import AdamAtan2 as Adam
@@ -306,7 +306,8 @@ class Critic(Module):
         self,
         *,
         dim_state,
-        num_actions,
+        num_cont_actions,
+        num_discrete_actions: tuple[int, ...] = (),
         dim_hiddens: tuple[int, ...] = (),
         layernorm = False,
         dropout = 0.,
@@ -316,25 +317,43 @@ class Critic(Module):
         super().__init__()
         assert not exists(num_quantiles) or num_quantiles > 0
 
-        self.returning_quantiles = exists(num_quantiles)
+        use_quantiles = exists(num_quantiles)
+        self.returning_quantiles = use_quantiles
         self.num_quantiles = num_quantiles
 
+        num_actions_split = tensor((num_cont_actions, *num_discrete_actions))
+
+        # determine the output dimension of the critic
+        # which is the sum of all the actions (continous and discrete), multiplied by the number of quantiles
+
+        critic_dim_out = num_actions_split
+        if use_quantiles:
+            critic_dim_out = critic_dim_out * num_quantiles
+
         self.to_values = MLP(
-            dim_state + num_actions,
-            dim_out = 1 if not self.returning_quantiles else num_quantiles,
+            dim_state + num_cont_actions,
+            dim_out = critic_dim_out.sum().item(),
             dim_hiddens = dim_hiddens,
             layernorm = layernorm,
             dropout = dropout
         )
 
-        self._n = num_actions
+        # save the number of quantiles and the number of actions, for splitting out the output of the critic correctly
 
-        # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
+        self.num_quantiles = num_quantiles
+        self.num_actions_split = num_actions_split.tolist()
+
+        # for tensor typing
+
+        self._n = num_cont_actions
+        self._q = num_quantiles
+
+        # quantiles
 
         if exists(quantiles):
             quantiles = tensor(quantiles)
         elif exists(num_quantiles):
-            quantiles = torch.linspace(0., 1., num_quantiles + 2)[1:-1]
+            quantiles = torch.linspace(0., 1., num_quantiles + 2)[1:-1] # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
 
         self.register_buffer('quantiles', quantiles)
 
@@ -343,9 +362,10 @@ class Critic(Module):
         state: Float['b ...'],
         cont_actions: Float['b {self._n}'] | None = None
     ) -> (
-        Float['b'] |
-        Float['b q']
+        tuple[Float['b {self._n}'], tuple[Float['b _'], ...]] |
+        tuple[Float['b {self._n} {self._q}'], tuple[Float['b _ {self._q}'], ...]]
     ):
+
         pack_input = compact([state, cont_actions])
 
         mlp_input, _ = pack(pack_input, 'b *')
@@ -353,9 +373,13 @@ class Critic(Module):
         values = self.to_values(mlp_input)
 
         if self.returning_quantiles:
-            return values
+            values = rearrange(values, '... (n q) -> ... n q', q = self.num_quantiles)
 
-        return rearrange(values, '... 1 -> ...')
+        split_dim = -2 if self.returning_quantiles else -1
+
+        cont_values, *discrete_values = values.split(self.num_actions_split, dim = split_dim)
+
+        return cont_values, tuple(discrete_values)
 
 class MultipleCritics(Module):
     @beartype
