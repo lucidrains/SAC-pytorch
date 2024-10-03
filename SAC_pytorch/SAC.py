@@ -30,6 +30,8 @@ Bool  = TorchTyping(jaxtyping.Bool)
 # ein notations
 # b - batch
 # n - number of actions
+# nc - number of continuous actions
+# nd - number of discrete actions
 # c - critics
 # q - quantiles
 
@@ -43,10 +45,22 @@ from ema_pytorch import EMA
 
 # constants
 
-ContinuousOutput = namedtuple('ContinuousOutput', ['mu', 'sigma'])
+ContinuousOutput = namedtuple('ContinuousOutput', [
+    'mu',
+    'sigma'
+])
 
-SoftActorOutput = namedtuple('SoftActorOutput', ['continuous', 'discrete'])
-SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', ['continuous', 'discrete', 'continuous_log_prob', 'discrete_log_probs', 'discrete_entropy'])
+SoftActorOutput = namedtuple('SoftActorOutput', [
+    'continuous',
+    'discrete'
+])
+
+SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', [
+    'continuous',
+    'continuous_log_prob',
+    'discrete',
+    'discrete_action_logits',
+])
 
 # helpers
 
@@ -232,7 +246,6 @@ class Actor(Module):
         cont_reparametrize = False,
         discrete_sample_temperature = 1.,
         discrete_sample_deterministic = False,
-        return_discrete_entropies = False
     ) -> (
         SoftActorOutput |
         SampledSoftActorOutput
@@ -266,12 +279,6 @@ class Actor(Module):
 
         scaled_squashed_cont_actions = squashed_cont_actions * self.num_cont_actions
 
-        # handle maybe discrete entropy
-
-        discrete_entropies = None
-        if return_discrete_entropies:
-            discrete_entropies = [entropy(logits) for logits in discrete_action_logits]
-
         # handle discrete
 
         sampled_discrete_actions = []
@@ -294,10 +301,9 @@ class Actor(Module):
 
         return SampledSoftActorOutput(
             scaled_squashed_cont_actions,
-            sampled_discrete_actions,
             cont_log_prob,
-            discrete_log_probs,
-            discrete_entropies
+            sampled_discrete_actions,
+            discrete_action_logits
         )
 
 class Critic(Module):
@@ -361,10 +367,7 @@ class Critic(Module):
         self,
         state: Float['b ...'],
         cont_actions: Float['b {self._n}'] | None = None
-    ) -> (
-        tuple[Float['b {self._n}'], tuple[Float['b _'], ...]] |
-        tuple[Float['b {self._n} {self._q}'], tuple[Float['b _ {self._q}'], ...]]
-    ):
+    ) -> tuple[Float['b ...'], ...]:
 
         pack_input = compact([state, cont_actions])
 
@@ -590,6 +593,8 @@ class SAC(Module):
 
         self.critics = critics
 
+        self.quantiled_critics = quantiled_critics
+
         # critic optimizers
 
         self.critics_optimizer = Adam(
@@ -615,7 +620,8 @@ class SAC(Module):
     def forward(
         self,
         states: Float['b ...'],
-        cont_actions: Float['b n'],
+        cont_actions: Float['b nc'],
+        discrete_actions: Int['b nd'],
         rewards: Float['b'],
         done: Bool['b'],
         next_states: Float['b ...']
@@ -632,22 +638,52 @@ class SAC(Module):
         with torch.no_grad():
             self.critics_target.eval()
 
-            next_q_value = self.critics_target(next_states, cont_actions = cont_actions)
+            next_cont_q_value, next_discrete_q_values = self.critics_target(next_states, cont_actions = cont_actions)
+
+            # outputs from actor
 
             actor_output = self.actor(states, sample = True, cont_reparametrize = True, return_discrete_entropies = True)
+
+            cont_log_prob = actor_output.continuous_log_prob
+            discrete_logits = actor_output.discrete_action_logits
+
+            # handle extra quantile last dimension if needed
+
+            if self.quantiled_critics:
+                cont_log_prob = rearrange(cont_log_prob, '... -> ... 1')
+                discrete_logits = [rearrange(t, '... -> ... 1'), for t in discrete_logits]
+
+            # learned temperature
+
             learned_entropy_weight = self.learned_entropy_temperature.alpha
 
-            cont_entropy = -actor_output.continuous_log_prob
-            discrete_entropies = actor_output.discrete_entropies
+            next_soft_state_values = []
 
-            next_soft_state_value = next_q_value + learned_entropy_weight * (cont_entropy + sum(discrete_entropies))
+            # first handle continuous soft state value
 
-        q_value = rewards + not_terminal * γ * next_soft_state_value
+            if exists(cont_log_prob):
+                cont_soft_state_value = next_cont_q_value - learned_entropy_weight * cont_log_prob
+
+                next_soft_state_values.append(cont_soft_state_value)
+
+            # then handle discrete contribution
+
+            if len(next_discrete_q_values) > 0:
+
+                for next_discrete_q_value, discrete_logit in zip(next_discrete_q_values, discrete_logits):
+                    discrete_prob = discrete_logits.softmax(dim = -1)
+                    discrete_logprob = log(discrete_prob)
+
+                    discrete_soft_state_value = (discrete_prob * (next_discrete_q_value - learned_entropy_weight * discrete_log_prob)).sum(dim = -1)
+
+                    next_soft_state_values.append(discrete_soft_state_value)
+
+        target_q_values = [(rewards + not_terminal * γ * soft_state_value) for soft_state_value in next_soft_state_values]
 
         pred_q_value = self.critics(
             states,
             cont_actions = cont_actions,
-            target_value = q_value
+            target_values = target_q_values
         )
 
         # update the critics
