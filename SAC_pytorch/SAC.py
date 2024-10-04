@@ -126,22 +126,6 @@ class Residual(Module):
     def forward(self, x, **kwargs):
         return self.fn(x, **kwargs) + self.residual_proj(x)
 
-class NegativeConcat(Module):
-    """
-    https://arxiv.org/abs/1706.00388v1
-    """
-    @beartype
-    def __init__(
-        self,
-        fn: Module
-    ):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x):
-        fn = self.fn
-        return torch.cat((fn(x), -fn(-x)), dim = -1)
-
 # mlp
 
 class MLP(Module):
@@ -154,7 +138,6 @@ class MLP(Module):
         layernorm = False,
         dropout = 0.,
         activation = nn.ReLU,
-        negative_concat = True,
         expansion_factor = 2,
         add_residual = True
     ):
@@ -166,9 +149,6 @@ class MLP(Module):
         however, be aware that Levine in his lecture has ablations that show layernorm alone (without dropout) is sufficient for regularization
         """
 
-        out_expansion_factor = (2 if negative_concat else 1) * expansion_factor
-        maybe_negative_concat = NegativeConcat if negative_concat else identity
-
         dim_hiddens = cast_tuple(dim_hiddens)
 
         layers = []
@@ -177,13 +157,14 @@ class MLP(Module):
 
         for dim_hidden in dim_hiddens:
 
+            dim_inner = dim_hidden * expansion_factor
 
             layer = Sequential(
-                nn.Linear(curr_dim, dim_hidden * expansion_factor),
+                nn.Linear(curr_dim, dim_inner),
                 nn.Dropout(dropout),
-                nn.LayerNorm(dim_hidden * expansion_factor) if layernorm else None,
-                maybe_negative_concat(activation()),
-                nn.Linear(dim_hidden * out_expansion_factor, dim_hidden)
+                nn.LayerNorm(dim_inner) if layernorm else None,
+                activation(),
+                nn.Linear(dim_inner, dim_hidden)
             )
 
             if add_residual:
