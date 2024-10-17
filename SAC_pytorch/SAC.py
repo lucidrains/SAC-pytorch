@@ -139,8 +139,7 @@ class BroMLP(Module):
         dropout = 0.,
         activation = nn.ReLU,
         expansion_factor = 2,
-        add_residual = True,
-        final_norm = True
+        final_norm = False
     ):
         super().__init__()
         """
@@ -161,12 +160,13 @@ class BroMLP(Module):
             layer = Sequential(
                 nn.Linear(dim_hidden, dim_inner),
                 nn.Dropout(dropout),
-                nn.LayerNorm(dim_inner),
+                nn.LayerNorm(dim_inner, bias = False),
                 activation(),
                 nn.Linear(dim_inner, dim_hidden),
-                nn.LayerNorm(dim_hidden),
+                nn.LayerNorm(dim_hidden, bias = False),
             )
 
+            nn.init.constant_(layer[-1].weight, 1e-5)
             layers.append(layer)
 
         # final layer out
