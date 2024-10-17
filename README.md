@@ -2,6 +2,57 @@
 
 Implementation of Soft Actor Critic and some of its improvements in Pytorch. Interest comes from watching <a href="https://www.youtube.com/watch?v=17NrtKHdPDw">this lecture</a>
 
+```python
+import torch
+from SAC_pytorch import (
+  SAC,
+  Actor,
+  Critic,
+  MultipleCritics
+)
+
+critic1 = Critic(
+  dim_state = 5,
+  num_cont_actions = 2,
+  num_discrete_actions = (5, 5),
+  num_quantiles = 3
+)
+
+critic2 = Critic(
+  dim_state = 5,
+  num_cont_actions = 2,
+  num_discrete_actions = (5, 5),
+  num_quantiles = 3
+)
+
+actor = Actor(
+  dim_state = 5,
+  num_cont_actions = 2,
+  num_discrete_actions = (5, 5)
+)
+
+agent = SAC(
+  actor = actor,
+  critics = [
+    dict(dim_state = 5, num_cont_actions = 2, num_discrete_actions = (5, 5)),
+    dict(dim_state = 5, num_cont_actions = 2, num_discrete_actions = (5, 5)),
+  ],
+  quantiled_critics = False
+)
+
+state = torch.randn(3, 5)
+cont_actions, discrete, cont_logprob, discrete_logprob = actor(state, sample = True)
+
+agent(
+  states = state,
+  cont_actions = cont_actions,
+  discrete_actions = discrete,
+  rewards = torch.randn(1),
+  done = torch.zeros(1).bool(),
+  next_states = state + 1
+)
+```
+
 ## Citations
 
 ```bibtex
