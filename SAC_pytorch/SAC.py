@@ -126,59 +126,56 @@ class Residual(Module):
     def forward(self, x, **kwargs):
         return self.fn(x, **kwargs) + self.residual_proj(x)
 
-# mlp
+# "bro" mlp
 
-class MLP(Module):
+class BroMLP(Module):
     @beartype
     def __init__(
         self,
         dim,
         dim_out,
-        dim_hiddens: int | tuple[int, ...],
-        layernorm = False,
+        dim_hidden,
+        depth = 3,
         dropout = 0.,
         activation = nn.ReLU,
         expansion_factor = 2,
-        add_residual = True
+        add_residual = True,
+        final_norm = True
     ):
         super().__init__()
         """
-        simple mlp for Q and value networks
-
-        following Figure 1 in https://arxiv.org/pdf/2110.02034.pdf for placement of dropouts and layernorm
-        however, be aware that Levine in his lecture has ablations that show layernorm alone (without dropout) is sufficient for regularization
+        following the design of BroNet https://arxiv.org/abs/2405.16158v1
         """
-
-        dim_hiddens = cast_tuple(dim_hiddens)
 
         layers = []
 
-        curr_dim = dim
+        self.proj_in = nn.Sequential(
+            nn.Linear(dim, dim_hidden),
+            activation()
+        )
 
-        for dim_hidden in dim_hiddens:
+        dim_inner = dim_hidden * expansion_factor
 
-            dim_inner = dim_hidden * expansion_factor
+        for _ in range(depth):
 
             layer = Sequential(
-                nn.Linear(curr_dim, dim_inner),
+                nn.Linear(dim_hidden, dim_inner),
                 nn.Dropout(dropout),
-                nn.LayerNorm(dim_inner) if layernorm else None,
+                nn.LayerNorm(dim_inner),
                 activation(),
-                nn.Linear(dim_inner, dim_hidden)
+                nn.Linear(dim_inner, dim_hidden),
+                nn.LayerNorm(dim_hidden),
             )
-
-            if add_residual:
-                layer = Residual(layer, curr_dim, dim_hidden)
 
             layers.append(layer)
 
-            curr_dim = dim_hidden
-
         # final layer out
 
-        layers.append(nn.Linear(curr_dim, dim_out))
-
         self.layers = ModuleList(layers)
+
+        self.final_norm = nn.LayerNorm(dim_hidden) if final_norm else nn.Identity()
+
+        self.proj_out = nn.Linear(dim_hidden, dim_out)
 
         # init
 
@@ -186,10 +183,13 @@ class MLP(Module):
 
     def forward(self, x):
 
-        for layer in self.layers:
-            x = layer(x)
+        x = self.proj_in(x)
 
-        return x
+        for layer in self.layers:
+            x = layer(x) + x
+
+        x = self.final_norm(x)
+        return self.proj_out(x)
 
 # main modules
 
@@ -200,6 +200,7 @@ class Actor(Module):
         *,
         dim_state,
         num_cont_actions,
+        mlp_depth = 3,
         num_discrete_actions: tuple[int, ...] = (),
         dim_hiddens: tuple[int, ...] = (),
         eps = 1e-5
@@ -214,8 +215,9 @@ class Actor(Module):
         self.num_discrete_actions = num_discrete_actions
         self.split_dims = (discrete_action_dims, cont_action_dims)
 
-        self.to_actions = MLP(
+        self.to_actions = BroMLP(
             dim_state,
+            depth = mlp_depth,
             dim_hiddens = dim_hiddens,
             dim_out = discrete_action_dims + cont_action_dims
         )
@@ -295,6 +297,7 @@ class Critic(Module):
         *,
         dim_state,
         num_cont_actions,
+        mlp_depth = 3,
         num_discrete_actions: tuple[int, ...] = (),
         dim_hiddens: tuple[int, ...] = (),
         layernorm = False,
@@ -317,8 +320,9 @@ class Critic(Module):
         if use_quantiles:
             critic_dim_out = critic_dim_out * num_quantiles
 
-        self.to_values = MLP(
+        self.to_values = BroMLP(
             dim_state + num_cont_actions,
+            depth = mlp_depth,
             dim_out = critic_dim_out.sum().item(),
             dim_hiddens = dim_hiddens,
             layernorm = layernorm,

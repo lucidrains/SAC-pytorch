@@ -1,1 +1,4 @@
-from SAC_pytorch.SAC import SAC
+from SAC_pytorch.SAC import (
+    SAC,
+    BroMLP
+)
