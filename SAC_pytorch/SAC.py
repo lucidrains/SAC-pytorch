@@ -9,7 +9,7 @@ from torch.distributions import Normal
 from torch import nn, einsum, Tensor, tensor
 from torch.nn import Module, ModuleList, Sequential
 
-from adam_atan2_pytorch import AdamAtan2 as Adam
+from adam_atan2_pytorch.adam_atan2_with_wasserstein_reg import AdamAtan2 as Adam
 
 # tensor typing
 
