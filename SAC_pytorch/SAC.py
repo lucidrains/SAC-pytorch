@@ -97,37 +97,10 @@ def gumbel_sample(t, temperature = 1., dim = -1):
     assert temperature > 0.
     return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
 
-def init_(m):
-    if not isinstance(m, nn.Linear):
-        return
-
-    gain = torch.nn.init.calculate_gain('relu')
-    torch.nn.init.orthogonal_(m.weight, gain)
-
-    if not exists(m.bias):
-        return
-
-    torch.nn.init.zeros_(m.bias)
-
 # helper classes
 
 def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
-
-class Residual(Module):
-    @beartype
-    def __init__(
-        self,
-        fn: Module,
-        dim_in,
-        dim_out
-    ):
-        super().__init__()
-        self.fn = fn
-        self.residual_proj = nn.Linear(dim_in, dim_out) if dim_in != dim_out else identity
-
-    def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) + self.residual_proj(x)
 
 # "bro" mlp
 
@@ -156,7 +129,7 @@ class BroMLP(Module):
 
         layers = []
 
-        self.proj_in = nn.Sequential(
+        self.proj_in = Sequential(
             nn.Linear(dim, dim_hidden),
             ReluSquared(),
             nn.LayerNorm(dim_hidden, bias = False),
@@ -185,10 +158,6 @@ class BroMLP(Module):
         self.final_norm = nn.LayerNorm(dim_hidden) if final_norm else nn.Identity()
 
         self.proj_out = nn.Linear(dim_hidden, dim_out)
-
-        # init
-
-        self.apply(init_)
 
     def forward(self, x):
 
