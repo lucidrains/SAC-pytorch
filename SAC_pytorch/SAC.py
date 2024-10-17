@@ -131,6 +131,10 @@ class Residual(Module):
 
 # "bro" mlp
 
+class ReluSquared(Module):
+    def forward(self, x):
+        return F.relu(x) ** 2
+
 class BroMLP(Module):
     @beartype
     def __init__(
@@ -140,7 +144,6 @@ class BroMLP(Module):
         dim_hidden = None,
         depth = 3,
         dropout = 0.,
-        activation = nn.ReLU,
         expansion_factor = 2,
         final_norm = False
     ):
@@ -155,7 +158,8 @@ class BroMLP(Module):
 
         self.proj_in = nn.Sequential(
             nn.Linear(dim, dim_hidden),
-            activation()
+            ReluSquared(),
+            nn.LayerNorm(dim_hidden, bias = False),
         )
 
         dim_inner = dim_hidden * expansion_factor
@@ -165,8 +169,8 @@ class BroMLP(Module):
             layer = Sequential(
                 nn.Linear(dim_hidden, dim_inner),
                 nn.Dropout(dropout),
+                ReluSquared(),
                 nn.LayerNorm(dim_inner, bias = False),
-                activation(),
                 nn.Linear(dim_inner, dim_hidden),
                 nn.LayerNorm(dim_hidden, bias = False),
             )
