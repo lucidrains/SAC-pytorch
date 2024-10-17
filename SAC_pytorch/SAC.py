@@ -68,6 +68,9 @@ SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', [
 def exists(v):
     return v is not None
 
+def default(v, d):
+    return v if exists(v) else d
+
 def compact(arr):
     return [*filter(exists, arr)]
 
@@ -134,7 +137,7 @@ class BroMLP(Module):
         self,
         dim,
         dim_out,
-        dim_hidden,
+        dim_hidden = None,
         depth = 3,
         dropout = 0.,
         activation = nn.ReLU,
@@ -145,6 +148,8 @@ class BroMLP(Module):
         """
         following the design of BroNet https://arxiv.org/abs/2405.16158v1
         """
+
+        dim_hidden = default(dim_hidden, dim * 2)
 
         layers = []
 
@@ -202,7 +207,7 @@ class Actor(Module):
         num_cont_actions,
         mlp_depth = 3,
         num_discrete_actions: tuple[int, ...] = (),
-        dim_hiddens: tuple[int, ...] = (),
+        dim_hidden = None,
         eps = 1e-5
     ):
         super().__init__()
@@ -218,7 +223,7 @@ class Actor(Module):
         self.to_actions = BroMLP(
             dim_state,
             depth = mlp_depth,
-            dim_hiddens = dim_hiddens,
+            dim_hidden = dim_hidden,
             dim_out = discrete_action_dims + cont_action_dims
         )
 
@@ -299,7 +304,7 @@ class Critic(Module):
         num_cont_actions,
         mlp_depth = 3,
         num_discrete_actions: tuple[int, ...] = (),
-        dim_hiddens: tuple[int, ...] = (),
+        dim_hidden = None,
         layernorm = False,
         dropout = 0.,
         num_quantiles: int | None = None,
@@ -324,8 +329,7 @@ class Critic(Module):
             dim_state + num_cont_actions,
             depth = mlp_depth,
             dim_out = critic_dim_out.sum().item(),
-            dim_hiddens = dim_hiddens,
-            layernorm = layernorm,
+            dim_hidden = dim_hidden,
             dropout = dropout
         )
 
