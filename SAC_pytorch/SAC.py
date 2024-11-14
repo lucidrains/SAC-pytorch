@@ -5,6 +5,7 @@ from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.distributions import Normal
 from torch import nn, einsum, Tensor, tensor
 from torch.nn import Module, ModuleList, Sequential
@@ -97,10 +98,66 @@ def gumbel_sample(t, temperature = 1., dim = -1):
     assert temperature > 0.
     return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
 
+# distributed helpers
+
+def is_distributed():
+    return dist.is_initialized() and dist.get_world_size() > 1
+
+def maybe_distributed_mean(t):
+    if not is_distributed():
+        return t
+
+    dist.all_reduce(t)
+    t = t / dist.get_world_size()
+    return t
+
 # helper classes
 
 def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
+
+# RSM Norm (not to be confused with RMSNorm from transformers)
+# this was proposed by SimBa https://arxiv.org/abs/2410.09754
+# experiments show this to outperform other types of normalization
+
+class RSMNorm(Module):
+    def __init__(self, eps = 1e-5):
+        # equation (3) in https://arxiv.org/abs/2410.09754
+        super().__init__()
+        self.eps = 1e-5
+
+        self.register_buffer('step', tensor(1))
+        self.register_buffer('running_mean', tensor(0.))
+        self.register_buffer('running_variance', tensor(1.))
+
+    def forward(
+        self,
+        x
+    ):
+        time = self.step.item()
+        mean = self.running_mean
+        variance = self.running_variance
+
+        normed = (x - mean) / variance.sqrt().clamp(min = self.eps)
+
+        if not self.training:
+            return normed
+
+        # update running mean and variance
+
+        with torch.no_grad():
+
+            new_obs_mean = maybe_distributed_mean(x.mean())
+            delta = new_obs_mean - mean
+
+            new_mean = mean + delta / time
+            new_variance = (time - 1) / time * (variance + (delta ** 2) / time)
+
+            self.step.add_(1)
+            self.running_mean.copy_(new_mean)
+            self.running_variance.copy_(new_variance)
+
+        return normed
 
 # "bro" mlp
 
@@ -118,12 +175,15 @@ class BroMLP(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
-        final_norm = False
+        final_norm = False,
+        rsmnorm_input = True
     ):
         super().__init__()
         """
         following the design of BroNet https://arxiv.org/abs/2405.16158v1
         """
+
+        self.rsmnorm = RSMNorm() if rsmnorm_input else nn.Identity()
 
         dim_hidden = default(dim_hidden, dim * 2)
 
@@ -161,6 +221,7 @@ class BroMLP(Module):
 
     def forward(self, x):
 
+        x = self.rsmnorm(x)
         x = self.proj_in(x)
 
         for layer in self.layers:
