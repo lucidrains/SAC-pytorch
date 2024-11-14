@@ -183,14 +183,11 @@ class BroMLP(Module):
         dropout = 0.,
         expansion_factor = 2,
         final_norm = False,
-        rsmnorm_input = True
     ):
         super().__init__()
         """
         following the design of BroNet https://arxiv.org/abs/2405.16158v1
         """
-
-        self.rsmnorm = RSMNorm(dim) if rsmnorm_input else nn.Identity()
 
         dim_hidden = default(dim_hidden, dim * 2)
 
@@ -228,7 +225,6 @@ class BroMLP(Module):
 
     def forward(self, x):
 
-        x = self.rsmnorm(x)
         x = self.proj_in(x)
 
         for layer in self.layers:
@@ -249,10 +245,12 @@ class Actor(Module):
         mlp_depth = 3,
         num_discrete_actions: tuple[int, ...] = (),
         dim_hidden = None,
-        eps = 1e-5
+        eps = 1e-5,
+        rsmnorm_input = True
     ):
         super().__init__()
         self.eps = eps
+        self.rsmnorm = RSMNorm(dim_state) if rsmnorm_input else nn.Identity()
 
         discrete_action_dims = sum(num_discrete_actions)
         cont_action_dims = num_cont_actions * 2
@@ -280,6 +278,8 @@ class Actor(Module):
         SoftActorOutput |
         SampledSoftActorOutput
     ):
+
+        state = self.rsmnorm(state)
 
         action_dims = self.to_actions(state)
 
@@ -349,10 +349,13 @@ class Critic(Module):
         layernorm = False,
         dropout = 0.,
         num_quantiles: int | None = None,
-        quantiles: tuple[float, ...] | None = None
+        quantiles: tuple[float, ...] | None = None,
+        rsmnorm_input = True
     ):
         super().__init__()
         assert not exists(num_quantiles) or num_quantiles > 0
+
+        self.rsmnorm = RSMNorm(dim_state) if rsmnorm_input else nn.Identity()
 
         use_quantiles = exists(num_quantiles)
         self.returning_quantiles = use_quantiles
@@ -398,6 +401,8 @@ class Critic(Module):
         state: Float['b ...'],
         cont_actions: Float['b {self._n}'] | None = None
     ) -> tuple[Float['b ...'], ...]:
+
+        state = self.rsmnorm(state)
 
         pack_input = compact([state, cont_actions])
 
