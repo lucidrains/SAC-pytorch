@@ -121,19 +121,26 @@ def Sequential(*modules):
 # experiments show this to outperform other types of normalization
 
 class RSMNorm(Module):
-    def __init__(self, eps = 1e-5):
+    def __init__(
+        self,
+        dim,
+        eps = 1e-5
+    ):
         # equation (3) in https://arxiv.org/abs/2410.09754
         super().__init__()
+        self.dim = dim
         self.eps = 1e-5
 
         self.register_buffer('step', tensor(1))
-        self.register_buffer('running_mean', tensor(0.))
-        self.register_buffer('running_variance', tensor(1.))
+        self.register_buffer('running_mean', torch.zeros(dim))
+        self.register_buffer('running_variance', torch.ones(dim))
 
     def forward(
         self,
         x
     ):
+        assert x.shape[-1] == self.dim, f'expected feature dimension of {self.dim} but received {x.shape[-1]}'
+
         time = self.step.item()
         mean = self.running_mean
         variance = self.running_variance
@@ -183,7 +190,7 @@ class BroMLP(Module):
         following the design of BroNet https://arxiv.org/abs/2405.16158v1
         """
 
-        self.rsmnorm = RSMNorm() if rsmnorm_input else nn.Identity()
+        self.rsmnorm = RSMNorm(dim) if rsmnorm_input else nn.Identity()
 
         dim_hidden = default(dim_hidden, dim * 2)
 
