@@ -124,16 +124,26 @@ class RSMNorm(Module):
     def __init__(
         self,
         dim,
-        eps = 1e-5
+        eps = 1e-5,
+        time_dilate_factor = 1.,
     ):
         # equation (3) in https://arxiv.org/abs/2410.09754
         super().__init__()
         self.dim = dim
         self.eps = 1e-5
 
+        self.time_dilate_factor = time_dilate_factor
+
         self.register_buffer('step', tensor(1))
         self.register_buffer('running_mean', torch.zeros(dim))
         self.register_buffer('running_variance', torch.ones(dim))
+
+    def reset_step(self):
+        self.step.zero_()
+
+    @property
+    def time(self):
+        return self.step / self.time_dilate_factor
 
     def forward(
         self,
@@ -141,7 +151,7 @@ class RSMNorm(Module):
     ):
         assert x.shape[-1] == self.dim, f'expected feature dimension of {self.dim} but received {x.shape[-1]}'
 
-        time = self.step.item()
+        time = self.time.item()
         mean = self.running_mean
         variance = self.running_variance
 
