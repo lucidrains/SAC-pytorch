@@ -176,13 +176,14 @@ class RSMNorm(Module):
 
         return normed
 
-# "bro" mlp
+# SimBa - Kaist + SonyAI research
 
 class ReluSquared(Module):
     def forward(self, x):
         return F.relu(x) ** 2
 
-class BroMLP(Module):
+class SimBa(Module):
+
     @beartype
     def __init__(
         self,
@@ -196,30 +197,25 @@ class BroMLP(Module):
     ):
         super().__init__()
         """
-        following the design of BroNet https://arxiv.org/abs/2405.16158v1
+        SimBa - https://arxiv.org/abs/2410.09754
         """
 
         dim_hidden = default(dim_hidden, dim * 2)
 
         layers = []
 
-        self.proj_in = Sequential(
-            nn.Linear(dim, dim_hidden),
-            ReluSquared(),
-            nn.LayerNorm(dim_hidden, bias = False),
-        )
+        self.proj_in = nn.Linear(dim, dim_hidden)
 
         dim_inner = dim_hidden * expansion_factor
 
         for _ in range(depth):
 
             layer = Sequential(
+                nn.LayerNorm(dim_hidden, bias = False),
                 nn.Linear(dim_hidden, dim_inner),
                 nn.Dropout(dropout),
                 ReluSquared(),
-                nn.LayerNorm(dim_inner, bias = False),
                 nn.Linear(dim_inner, dim_hidden),
-                nn.LayerNorm(dim_hidden, bias = False),
             )
 
             nn.init.constant_(layer[-1].weight, 1e-5)
@@ -269,7 +265,7 @@ class Actor(Module):
         self.num_discrete_actions = num_discrete_actions
         self.split_dims = (discrete_action_dims, cont_action_dims)
 
-        self.to_actions = BroMLP(
+        self.to_actions = SimBa(
             dim_state,
             depth = mlp_depth,
             dim_hidden = dim_hidden,
@@ -379,7 +375,7 @@ class Critic(Module):
         if use_quantiles:
             critic_dim_out = critic_dim_out * num_quantiles
 
-        self.to_values = BroMLP(
+        self.to_values = SimBa(
             dim_state + num_cont_actions,
             depth = mlp_depth,
             dim_out = critic_dim_out.sum().item(),

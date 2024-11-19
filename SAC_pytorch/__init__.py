@@ -4,6 +4,5 @@ from SAC_pytorch.SAC import (
     Critic,
     MultipleCritics,
     MultipleQuantileCritics,
-    BroMLP,
     RSMNorm
 )
