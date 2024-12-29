@@ -12,6 +12,8 @@ from torch.nn import Module, ModuleList, Sequential
 
 from adam_atan2_pytorch.adam_atan2_with_wasserstein_reg import AdamAtan2 as Adam
 
+from hyper_connections import HyperConnections
+
 # tensor typing
 
 import jaxtyping
@@ -194,6 +196,7 @@ class SimBa(Module):
         dropout = 0.,
         expansion_factor = 2,
         final_norm = False,
+        num_residual_streams = 4
     ):
         super().__init__()
         """
@@ -208,6 +211,8 @@ class SimBa(Module):
 
         dim_inner = dim_hidden * expansion_factor
 
+        init_hyper_conn, self.expand_streams, self.reduce_streams = HyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
+
         for _ in range(depth):
 
             layer = Sequential(
@@ -219,7 +224,8 @@ class SimBa(Module):
             )
 
             nn.init.constant_(layer[-1].weight, 1e-5)
-            layers.append(layer)
+
+            layers.append(init_hyper_conn(dim = dim_hidden, branch = layer))
 
         # final layer out
 
@@ -233,8 +239,12 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
+        x = self.expand_streams(x)
+
         for layer in self.layers:
-            x = layer(x) + x
+            x = layer(x)
+
+        x = self.reduce_streams(x)
 
         x = self.final_norm(x)
         return self.proj_out(x)
