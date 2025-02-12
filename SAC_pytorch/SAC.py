@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributions import Normal
-from torch import nn, einsum, Tensor, tensor
+from torch import nn, einsum, Tensor, tensor, cat, stack
 from torch.nn import Module, ModuleList, Sequential
 
 from adam_atan2_pytorch import AdoptAtan2 as Adopt
@@ -349,7 +349,7 @@ class Actor(Module):
 
         return SampledSoftActorOutput(
             scaled_squashed_cont_actions,
-            torch.stack(sampled_discrete_actions, dim = -1),
+            stack(sampled_discrete_actions, dim = -1),
             cont_log_prob,
             discrete_action_logits
         )
@@ -453,7 +453,7 @@ class MultipleCritics(Module):
     ):
         critics_values = [critic(states, cont_actions) for critic in self.critics]
 
-        critics_values = [torch.stack(one_value_for_critics) for one_value_for_critics in zip(*critics_values)]
+        critics_values = [stack(one_value_for_critics) for one_value_for_critics in zip(*critics_values)]
 
         if not exists(target_values):
 
@@ -461,7 +461,7 @@ class MultipleCritics(Module):
 
             for critic_values in critics_values:
                 if self.use_softmin:
-                    values = torch.stack(values, dim = -1)
+                    values = stack(values, dim = -1)
                     softmin = (-values).softmax(dim = -1)
 
                     min_critic_value = (softmin * critic_values).sum(dim = -1)
@@ -490,6 +490,87 @@ class MultipleCritics(Module):
             return reduced_losses
 
         return reduced_losses, losses
+
+class MultipleCriticsWithClassificationLoss(Module):
+    @beartype
+    def __init__(
+        self,
+        *critics: Critic,
+        use_softmin = False,
+        hl_gauss_loss: dict | HLGaussLoss
+    ):
+        super().__init__()
+        assert len(critics) > 0
+        assert all([critic.dim_out == 1 for critic in critics]), 'this wrapper only allows for critics that return a single predicted value per action'
+
+        self.num_critics = len(critics)
+        self.critics = ModuleList(critics)
+
+        self.use_softmin = use_softmin
+
+        if isinstance(hl_gauss_loss, dict):
+            hl_gauss_loss = HLGaussLoss(**hl_gauss_loss)
+
+        self.hl_gauss_loss = hl_gauss_loss
+
+    def forward(
+        self,
+        states: Float['b ...'],
+        cont_actions: Float['b nc'] | None = None,
+        discrete_actions: Int['b nd'] | None = None,
+        target_values: Float['b n'] | None = None,
+        return_breakdown = False,
+        **kwargs
+    ):
+        critics_values = [critic(states, cont_actions) for critic in self.critics]
+
+        critics_values = []
+
+        for one_value_for_critics in zip(*critics_values):
+            stacked_critic_values = stack(one_value_for_critics)
+
+            stacked_critic_values = self.hl_gauss_loss(stacked_critic_values)
+
+            critics_values.append(stacked_critic_values)
+
+        if not exists(target_values):
+
+            min_critic_values = []
+
+            for critic_values in critics_values:
+                if self.use_softmin:
+                    values = stack(values, dim = -1)
+                    softmin = (-values).softmax(dim = -1)
+
+                    min_critic_value = (softmin * critic_values).sum(dim = -1)
+                else:
+                    min_critic_value = torch.minimum(*critic_values)
+
+                min_critic_values.append(min_critic_value)
+
+            if not return_breakdown:
+                return min_critic_values
+
+            return min_critic_values, values
+
+        cont_critics_values, *discrete_critics_values = critics_values
+
+        discrete_critics_values = [get_at('c b [l] bins, b -> c b bins', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+
+        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b * bins')
+
+        target_values = repeat(target_values, '... -> c ...', c = self.num_critics)
+
+        # from "Stop Regressing" paper out of deepmind, Farebrother et al
+
+        cross_entropy_losses = self.hl_gauss_loss(values, target_values, reduction = 'none')
+
+        reduced_losses = reduce(cross_entropy_losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
+
+        if not return_breakdown:
+            return reduced_losses
+
+        return reduced_losses, cross_entropy_losses
 
 class MultipleQuantileCritics(Module):
     @beartype
@@ -531,7 +612,7 @@ class MultipleQuantileCritics(Module):
     ):
         critics_quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
 
-        critics_quantile_atoms = [torch.stack(one_value_for_critics) for one_value_for_critics in zip(*critics_quantile_atoms)]
+        critics_quantile_atoms = [stack(one_value_for_critics) for one_value_for_critics in zip(*critics_quantile_atoms)]
 
         if not exists(target_values):
 
