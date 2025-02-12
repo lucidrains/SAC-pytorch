@@ -10,9 +10,11 @@ from torch.distributions import Normal
 from torch import nn, einsum, Tensor, tensor
 from torch.nn import Module, ModuleList, Sequential
 
-from adam_atan2_pytorch.adam_atan2_with_wasserstein_reg import AdamAtan2 as Adam
+from adam_atan2_pytorch import AdoptAtan2 as Adopt
 
 from hyper_connections import HyperConnections
+
+from hl_gauss_pytorch import HLGaussLoss
 
 # tensor typing
 
@@ -364,26 +366,21 @@ class Critic(Module):
         dim_hidden = None,
         layernorm = False,
         dropout = 0.,
-        num_quantiles: int | None = None,
-        quantiles: tuple[float, ...] | None = None,
-        rsmnorm_input = True
+        dim_out = 1,
+        rsmnorm_input = True,
     ):
         super().__init__()
-        assert not exists(num_quantiles) or num_quantiles > 0
 
         self.rsmnorm = RSMNorm(dim_state) if rsmnorm_input else nn.Identity()
 
-        use_quantiles = exists(num_quantiles)
-        self.returning_quantiles = use_quantiles
+        dim_out = default(dim_out, dim_state)
 
         num_actions_split = tensor((num_cont_actions, *num_discrete_actions))
 
         # determine the output dimension of the critic
         # which is the sum of all the actions (continous and discrete), multiplied by the number of quantiles
 
-        critic_dim_out = num_actions_split
-        if use_quantiles:
-            critic_dim_out = critic_dim_out * num_quantiles
+        critic_dim_out = num_actions_split * dim_out
 
         self.to_values = SimBa(
             dim_state + num_cont_actions,
@@ -395,22 +392,14 @@ class Critic(Module):
 
         # save the number of quantiles and the number of actions, for splitting out the output of the critic correctly
 
-        self.num_quantiles = num_quantiles
         self.num_actions_split = num_actions_split.tolist()
+
+        self.dim_out = dim_out
 
         # for tensor typing
 
         self._n = num_cont_actions
-        self._q = num_quantiles
-
-        # quantiles
-
-        if exists(quantiles):
-            quantiles = tensor(quantiles)
-        elif exists(num_quantiles):
-            quantiles = torch.linspace(0., 1., num_quantiles + 2)[1:-1] # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
-
-        self.register_buffer('quantiles', quantiles)
+        self._o = dim_out
 
     def forward(
         self,
@@ -426,10 +415,12 @@ class Critic(Module):
 
         values = self.to_values(mlp_input)
 
-        if self.returning_quantiles:
-            values = rearrange(values, '... (n q) -> ... n q', q = self.num_quantiles)
+        greater_one_output_dim = self.dim_out > 1
 
-        split_dim = -2 if self.returning_quantiles else -1
+        if greater_one_output_dim:
+            values = rearrange(values, '... (n o) -> ... n o', o = self.dim_out)
+
+        split_dim = -2 if greater_one_output_dim else -1
 
         values = values.split(self.num_actions_split, dim = split_dim)
 
@@ -505,25 +496,29 @@ class MultipleQuantileCritics(Module):
     def __init__(
         self,
         *critics: Critic,
+        quantiles: list[float] | Tensor | None = None,
         frac_atom_keep = 0.75 # will truncate 25% of the top values
     ):
         super().__init__()
         assert len(critics) > 0
-        assert all([critic.returning_quantiles for critic in critics]), 'all critics must be returning quantiles'
-        assert len(set([critic.num_quantiles for critic in critics])) == 1, 'all critics must have same number of quantiles'
+        assert all([critic.dim_out > 1 for critic in critics]), 'all critics must be returning greater than one output dimension, assumed as quantiles'
+        assert len(set([critic.dim_out for critic in critics])) == 1, 'all critics must have same number of output dimensions for quantiled training'
 
         self.num_critics = len(critics)
 
         self.critics = ModuleList(critics)
         self.num_atom_keep = int(frac_atom_keep * self.num_critics * self.num_quantiles)
 
-    @property
-    def quantiles(self):
-        return self.critics[0].quantiles
+        # quantiles
+
+        num_quantiles = self.num_quantiles
+        quantiles = torch.linspace(0., 1., num_quantiles + 2)[1:-1] # excluding 0 and 1 - say 3 quantiles will be 0.25, 0.5, 0.75
+
+        self.register_buffer('quantiles', quantiles)
 
     @property
     def num_quantiles(self):
-        return self.critics[0].num_quantiles
+        return self.critics[0].dim_out
 
     def forward(
         self,
@@ -680,7 +675,7 @@ class SAC(Module):
 
         self.actor = actor
 
-        self.actor_optimizer = Adam(
+        self.actor_optimizer = Adopt(
             actor.parameters(),
             lr = actor_learning_rate,
             regen_reg_rate = actor_regen_reg_rate
@@ -692,7 +687,7 @@ class SAC(Module):
             num_discrete_actions = actor.num_discrete_actions
         )
 
-        self.temperature_optimizer = Adam(
+        self.temperature_optimizer = Adopt(
             self.learned_entropy_temperature.parameters(),
             lr = temperature_learning_rate,
         )
@@ -716,7 +711,7 @@ class SAC(Module):
 
         # critic optimizers
 
-        self.critics_optimizer = Adam(
+        self.critics_optimizer = Adopt(
             critics.parameters(),
             lr = critics_learning_rate,
             regen_reg_rate = critics_regen_reg_rate
