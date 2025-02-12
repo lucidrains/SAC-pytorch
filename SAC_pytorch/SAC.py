@@ -435,7 +435,7 @@ class MultipleCritics(Module):
     ):
         super().__init__()
         assert len(critics) > 0
-        assert all([not critic.returning_quantiles for critic in critics]), 'this wrapper only allows for non-quantile critics'
+        assert all([critic.dim_out == 1 for critic in critics]), 'this wrapper only allows for critics that return a single predicted value per action'
 
         self.num_critics = len(critics)
         self.critics = ModuleList(critics)
