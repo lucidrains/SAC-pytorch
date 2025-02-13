@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import partial
 
 import math
 from collections import namedtuple
@@ -14,7 +15,7 @@ from adam_atan2_pytorch import AdoptAtan2 as Adopt
 
 from hyper_connections import HyperConnections
 
-from hl_gauss_pytorch import HLGaussLoss
+from hl_gauss_pytorch import HLGaussLoss, HLGaussLossFromSupport
 
 # tensor typing
 
@@ -496,12 +497,12 @@ class MultipleCriticsWithClassificationLoss(Module):
     def __init__(
         self,
         *critics: Critic,
+        hl_gauss_loss: dict | HLGaussLossFromSupport,
         use_softmin = False,
-        hl_gauss_loss: dict | HLGaussLoss
     ):
         super().__init__()
         assert len(critics) > 0
-        assert all([critic.dim_out == 1 for critic in critics]), 'this wrapper only allows for critics that return a single predicted value per action'
+        assert all([critic.dim_out > 1 for critic in critics]), 'the critic must return multiple bins for classification loss'
 
         self.num_critics = len(critics)
         self.critics = ModuleList(critics)
@@ -522,12 +523,15 @@ class MultipleCriticsWithClassificationLoss(Module):
         return_breakdown = False,
         **kwargs
     ):
-        critics_values = [critic(states, cont_actions) for critic in self.critics]
+        raw_critics_values = [critic(states, cont_actions) for critic in self.critics]
 
+        binned_critics_values = []
         critics_values = []
 
-        for one_value_for_critics in zip(*critics_values):
+        for one_value_for_critics in zip(*raw_critics_values):
             stacked_critic_values = stack(one_value_for_critics)
+
+            binned_critics_values.append(stacked_critic_values)
 
             stacked_critic_values = self.hl_gauss_loss(stacked_critic_values)
 
@@ -553,7 +557,7 @@ class MultipleCriticsWithClassificationLoss(Module):
 
             return min_critic_values, values
 
-        cont_critics_values, *discrete_critics_values = critics_values
+        cont_critics_values, *discrete_critics_values = binned_critics_values
 
         discrete_critics_values = [get_at('c b [l] bins, b -> c b bins', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
@@ -734,9 +738,11 @@ class SAC(Module):
             list[dict] |
             list[Critic] |
             MultipleCritics |
-            MultipleQuantileCritics
+            MultipleQuantileCritics |
+            MultipleCriticsWithClassificationLoss
         ),
         quantiled_critics = False,
+        hl_gauss_loss: dict | HLGaussLossFromSupport | None = None,
         reward_discount_rate = 0.99,
         reward_scale = 1.,
         actor_learning_rate = 3e-4,
@@ -779,12 +785,27 @@ class SAC(Module):
         if is_bearable(critics, list[dict]):
             critics = [Critic(**critic) for critic in critics]
 
-        multiple_critic_klass = MultipleCritics if not quantiled_critics else MultipleQuantileCritics
+        critic_dim_outs = {critic.dim_out for critic in critics}
+
+        assert len(critic_dim_outs) == 1, 'critics must all have the same output dimension'
+
+        critic_dim_out = list(critic_dim_outs)[0]
+
+        critic_kwargs = dict()
+
+        if critic_dim_out == 1:
+            critic_klass = MultipleCritics
+        elif critic_dim_out > 1 and not quantiled_critics:
+            assert exists(hl_gauss_loss), 'hl_gauss_loss must be set'
+            critic_klass = MultipleCriticsWithClassificationLoss
+            critic_kwargs = dict(hl_gauss_loss = hl_gauss_loss)
+        else:
+            critic_klass = MultipleQuantileCritics
 
         if is_bearable(critics, list[Critic]):
-            critics = multiple_critic_klass(*critics)
+            critics = critic_klass(*critics, **critic_kwargs)
 
-        assert isinstance(critics, multiple_critic_klass), f'expected {multiple_critic_klass.__name__} but received critics wrapped with {type(critics).__name__}'
+        assert isinstance(critics, critic_klass), f'expected {critic_klass.__name__} but received critics wrapped with {type(critics).__name__}'
 
         self.critics = critics
 
