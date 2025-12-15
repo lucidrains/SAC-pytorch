@@ -686,7 +686,7 @@ class LearnedEntropyTemperature(Module):
         self.has_discrete = len(num_discrete_actions) > 0
         self.has_continuous = num_cont_actions > 0
 
-        self.discrete_entropy_targets = [0.98 * math.log(one_num_discrete_actions)for one_num_discrete_actions in num_discrete_actions] 
+        self.discrete_entropy_targets = [0.98 * math.log(one_num_discrete_actions) for one_num_discrete_actions in num_discrete_actions]
         self.continuous_entropy_target = num_cont_actions
 
     @property
@@ -699,7 +699,7 @@ class LearnedEntropyTemperature(Module):
         discrete_logits: tuple[Float['b _'], ...] | None = None,
         return_breakdown = False
     ):
-        assert exists(cont_log_prob) or exists(discrete_log_prob)
+        assert exists(cont_log_prob) or exists(discrete_logits)
 
         alpha = self.alpha
 
@@ -767,7 +767,7 @@ class SAC(Module):
             lr = actor_learning_rate,
             regen_reg_rate = actor_regen_reg_rate
         )
-        # based on the actor hyperparameters, init the leraned temperature container
+        # based on the actor hyperparameters, init the learned temperature container
 
         self.learned_entropy_temperature = LearnedEntropyTemperature(
             num_cont_actions = actor.num_cont_actions,
