@@ -1,6 +1,10 @@
-## SAC (Soft Actor Critic) - Pytorch (wip)
+## SAC (Soft Actor Critic) - Pytorch
 
 Implementation of Soft Actor Critic and some of its improvements in Pytorch. Interest comes from watching <a href="https://www.youtube.com/watch?v=17NrtKHdPDw">this lecture</a>
+
+Update: I no longer believe in Q-learning as a base technique (it does alright for finetuning policies trained with other methods, but alone is insufficient).
+
+Will place my bets on [contrastive RL](https://ben-eysenbach.github.io/contrastive_rl/) instead
 
 ```python
 import torch
