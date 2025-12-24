@@ -1,6 +1,6 @@
 [project]
 name = "SAC-pytorch"
-version = "0.0.16"
+version = "0.0.17"
 description = "Soft Actor Critic - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

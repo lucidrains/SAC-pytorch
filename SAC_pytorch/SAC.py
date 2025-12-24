@@ -350,8 +350,8 @@ class Actor(Module):
 
         return SampledSoftActorOutput(
             scaled_squashed_cont_actions,
-            stack(sampled_discrete_actions, dim = -1),
             cont_log_prob,
+            stack(sampled_discrete_actions, dim = -1),
             discrete_action_logits
         )
 
