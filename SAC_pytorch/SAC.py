@@ -897,8 +897,12 @@ class SAC(Module):
 
         if self.quantiled_critics:
             next_soft_state_values, _ = pack(next_soft_state_values, 'b * q')
+            rewards = rearrange(rewards, 'b -> b 1 1')
+            not_terminal = rearrange(not_terminal, 'b -> b 1 1')
         else:
             next_soft_state_values, _ = pack(next_soft_state_values, 'b *')
+            rewards = rearrange(rewards, 'b -> b 1')
+            not_terminal = rearrange(not_terminal, 'b -> b 1')
 
         target_q_values = rewards + not_terminal * γ * next_soft_state_values
 

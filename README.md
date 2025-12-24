@@ -43,7 +43,7 @@ agent = SAC(
 )
 
 state = torch.randn(3, 5)
-cont_actions, discrete, cont_logprob, discrete_logprob = actor(state, sample = True)
+cont_actions, cont_logprob, discrete, discrete_logprob = actor(state, sample = True)
 
 agent(
     states = state,
