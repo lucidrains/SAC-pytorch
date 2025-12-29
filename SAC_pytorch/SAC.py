@@ -324,7 +324,7 @@ class Actor(Module):
         squashed_cont_actions = sampled_cont_actions.tanh() # tanh squashing
 
         cont_log_prob = Normal(mu, sigma).log_prob(sampled_cont_actions)
-        cont_log_prob = cont_log_prob - log(1. - squashed_cont_actions ** 2, eps = self.eps)
+        cont_log_prob = cont_log_prob - 2 * (log(tensor(2.)) - sampled_cont_actions - F.softplus(-2 * sampled_cont_actions))
 
         scaled_squashed_cont_actions = squashed_cont_actions * self.num_cont_actions
 
