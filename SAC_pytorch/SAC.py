@@ -104,6 +104,32 @@ def gumbel_sample(t, temperature = 1., dim = -1):
     assert temperature > 0.
     return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
 
+# expectile regression
+# for expectile bellman proposed by https://arxiv.org/abs/2406.04081v1, which obviates need for multi critic for alleviating overestimation bias
+
+def expectile_l2_loss(
+    x,
+    target,
+    tau = 0.5,  # 0.5 would be the classic l2 loss - less would weigh negative higher, and more would weigh positive higher
+    reduction = 'mean'
+):
+    assert 0 <= tau <= 1.
+    assert reduction in {'mean', 'none'}
+
+    if tau == 0.5:
+        return F.mse_loss(x, target, reduction = reduction)
+
+    diff = x - target
+
+    weight = torch.where(diff < 0, tau, 1. - tau)
+
+    loss = (weight * diff.square())
+
+    if reduction == 'mean':
+        loss = loss.mean()
+
+    return loss
+
 # orthogonal residual updates
 # https://arxiv.org/abs/2505.11881
 
@@ -378,7 +404,7 @@ class Critic(Module):
         layernorm = False,
         dropout = 0.,
         dim_out = 1,
-        rsmnorm_input = True,
+        rsmnorm_input = True
     ):
         super().__init__()
 
@@ -442,16 +468,19 @@ class MultipleCritics(Module):
     def __init__(
         self,
         *critics: Critic,
-        use_softmin = False
+        use_softmin = False,
+        expectile_l2_loss_tau = 0.5 # regular mse loss if 0.5
     ):
         super().__init__()
         assert len(critics) > 0
         assert all([critic.dim_out == 1 for critic in critics]), 'this wrapper only allows for critics that return a single predicted value per action'
 
         self.num_critics = len(critics)
+        self.one_critic = len(critics) == 1
         self.critics = ModuleList(critics)
 
         self.use_softmin = use_softmin
+        self.expectile_l2_loss_tau = expectile_l2_loss_tau
 
     def forward(
         self,
@@ -476,6 +505,10 @@ class MultipleCritics(Module):
                     softmin = (-values).softmax(dim = -1)
 
                     min_critic_value = (softmin * critic_values).sum(dim = -1)
+
+                elif self.one_critic:
+                    min_critic_value = critic_values[0]
+
                 else:
                     min_critic_value = torch.minimum(*critic_values)
 
@@ -494,7 +527,8 @@ class MultipleCritics(Module):
         values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b *')
 
         target_values = repeat(target_values, '... -> c ...', c = self.num_critics)
-        losses = F.mse_loss(values, target_values, reduction = 'none')
+
+        losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
 
         reduced_losses = reduce(losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
 
@@ -764,6 +798,7 @@ class SAC(Module):
         critic_target_ema_decay = 0.99,
         critics_learning_rate = 3e-4,
         critics_regen_reg_rate = 1e-4,
+        multiple_critics_kwargs: dict = dict(),
         temperature_learning_rate = 3e-4,
         ema_kwargs: dict = dict()
     ):
@@ -809,6 +844,7 @@ class SAC(Module):
 
         if critic_dim_out == 1:
             critic_klass = MultipleCritics
+            critic_kwargs = multiple_critics_kwargs
         elif critic_dim_out > 1 and not quantiled_critics:
             assert exists(hl_gauss_loss), 'hl_gauss_loss must be set'
             critic_klass = MultipleCriticsWithClassificationLoss
@@ -891,7 +927,7 @@ class SAC(Module):
             if exists(next_cont_log_prob):
                 if self.quantiled_critics:
                     next_cont_log_prob = rearrange(next_cont_log_prob, '... -> ... 1')
-    
+
                 cont_soft_state_value = next_cont_q_value - learned_entropy_weight * next_cont_log_prob
                 next_soft_state_values.append(cont_soft_state_value)
 

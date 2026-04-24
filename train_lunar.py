@@ -53,7 +53,9 @@ def main(
     max_steps_per_episode:  int = 500,
     update_every_episodes:  int = 25,
     target_reward:          float = 25.,
-    rolling_window:         int = 20
+    rolling_window:         int = 20,
+    num_critics:            int = 2,
+    expectile_l2_loss_tau:  float = 0.45,
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -101,12 +103,15 @@ def main(
 
     actor = Actor(**actor_critic_kwargs)
 
-    critics = [Critic(**actor_critic_kwargs, dim_out = 1) for _ in range(2)]
+    critics = [Critic(**actor_critic_kwargs, dim_out = 1) for _ in range(num_critics)]
 
     agent = SAC(
         actor = actor,
         critics = critics,
         quantiled_critics = False,
+        multiple_critics_kwargs = dict(
+            expectile_l2_loss_tau = expectile_l2_loss_tau
+        ),
         reward_discount_rate = gamma,
         actor_learning_rate = learning_rate,
         critics_learning_rate = learning_rate,
