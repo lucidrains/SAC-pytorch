@@ -1,6 +1,6 @@
 [project]
 name = "SAC-pytorch"
-version = "0.0.19"
+version = "0.0.20"
 description = "Soft Actor Critic - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,8 +30,7 @@ dependencies = [
     'einx[torch]>=0.3.0',
     'ema-pytorch>=0.6.2',
     'jaxtyping',
-    'hl-gauss-loss>=0.1.11',
-    'soft-moe-pytorch>=0.1.6',
+    'hl-gauss-pytorch>=0.1.11',
     'torch>=2.0'
 ]
 
@@ -63,3 +62,11 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["SAC_pytorch"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "SAC_pytorch",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]

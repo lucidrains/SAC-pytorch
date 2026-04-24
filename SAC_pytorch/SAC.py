@@ -13,8 +13,6 @@ from torch.nn import Module, ModuleList, Sequential
 
 from adam_atan2_pytorch import AdoptAtan2 as Adopt
 
-from hyper_connections import HyperConnections
-
 from hl_gauss_pytorch import HLGaussLoss, HLGaussLossFromSupport
 
 # tensor typing
@@ -91,6 +89,9 @@ def cast_tuple(t, length = 1):
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
+def l2norm(t):
+    return F.normalize(t, p = 2, dim = -1)
+
 def entropy(t, eps = 1e-20):
     prob = t.softmax(dim = -1)
     return (-prob * log(prob, eps = eps)).sum(dim = -1)
@@ -102,6 +103,21 @@ def gumbel_noise(t):
 def gumbel_sample(t, temperature = 1., dim = -1):
     assert temperature > 0.
     return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
+
+# orthogonal residual updates
+# https://arxiv.org/abs/2505.11881
+
+def orthog_project(x, y):
+    dtype = x.dtype
+
+    if x.device.type != 'mps':
+        x, y = x.double(), y.double()
+
+    unit = l2norm(y)
+    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
+    orthog = x - parallel
+
+    return orthog.to(dtype)
 
 # distributed helpers
 
@@ -198,8 +214,7 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
-        final_norm = False,
-        num_residual_streams = 4
+        final_norm = False
     ):
         super().__init__()
         """
@@ -214,8 +229,6 @@ class SimBa(Module):
 
         dim_inner = dim_hidden * expansion_factor
 
-        init_hyper_conn, self.expand_streams, self.reduce_streams = HyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
-
         for _ in range(depth):
 
             layer = Sequential(
@@ -228,7 +241,7 @@ class SimBa(Module):
 
             nn.init.constant_(layer[-1].weight, 1e-5)
 
-            layers.append(init_hyper_conn(dim = dim_hidden, branch = layer))
+            layers.append(layer)
 
         # final layer out
 
@@ -242,12 +255,9 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
-        x = self.expand_streams(x)
-
         for layer in self.layers:
-            x = layer(x)
-
-        x = self.reduce_streams(x)
+            layer_out = layer(x)
+            x = x + orthog_project(layer_out, x)
 
         x = self.final_norm(x)
         return self.proj_out(x)
@@ -351,7 +361,7 @@ class Actor(Module):
         return SampledSoftActorOutput(
             scaled_squashed_cont_actions,
             cont_log_prob,
-            stack(sampled_discrete_actions, dim = -1),
+            stack(sampled_discrete_actions, dim = -1) if len(sampled_discrete_actions) > 0 else None,
             discrete_action_logits
         )
 
@@ -478,7 +488,8 @@ class MultipleCritics(Module):
 
         cont_critics_values, *discrete_critics_values = critics_values
 
-        discrete_critics_values = [get_at('c b [l], b -> c b', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+        if exists(discrete_actions):
+            discrete_critics_values = [get_at('c b [l], b -> c b', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
         values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b *')
 
@@ -559,7 +570,8 @@ class MultipleCriticsWithClassificationLoss(Module):
 
         cont_critics_values, *discrete_critics_values = binned_critics_values
 
-        discrete_critics_values = [get_at('c b [l] bins, b -> c b bins', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+        if exists(discrete_actions):
+            discrete_critics_values = [get_at('c b [l] bins, b -> c b bins', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
         values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b * bins')
 
@@ -650,7 +662,9 @@ class MultipleQuantileCritics(Module):
             return return_value, critics_quantile_atoms
 
         cont_quantile_atoms, *discrete_quantile_atoms = critics_quantile_atoms
-        discrete_quantile_atoms = [get_at('c b [l] q, b -> c b q', discrete_quantile_atom, discrete_action) for discrete_quantile_atom, discrete_action in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
+
+        if exists(discrete_actions):
+            discrete_quantile_atoms = [get_at('c b [l] q, b -> c b q', discrete_quantile_atom, discrete_action) for discrete_quantile_atom, discrete_action in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
 
         quantile_atoms, _ = pack([cont_quantile_atoms, *discrete_quantile_atoms], 'c b * q')
 
@@ -856,14 +870,15 @@ class SAC(Module):
         with torch.no_grad():
             self.critics_target.eval()
 
-            next_cont_q_value, *next_discrete_q_values = self.critics_target(next_states, cont_actions = cont_actions)
+            # outputs from actor for the next states
 
-            # outputs from actor
+            next_actor_output = self.actor(next_states, sample = True)
 
-            actor_output = self.actor(states, sample = True)
+            next_cont_actions = next_actor_output.continuous
+            next_cont_log_prob = next_actor_output.continuous_log_prob
+            next_discrete_logits = next_actor_output.discrete_action_logits
 
-            cont_log_prob = actor_output.continuous_log_prob
-            discrete_logits = actor_output.discrete_action_logits
+            next_cont_q_value, *next_discrete_q_values = self.critics_target(next_states, cont_actions = next_cont_actions)
 
             # learned temperature
 
@@ -873,26 +888,26 @@ class SAC(Module):
 
             # first handle continuous soft state value
 
-            if exists(cont_log_prob):
+            if exists(next_cont_log_prob):
                 if self.quantiled_critics:
-                    cont_log_prob = rearrange(cont_log_prob, '... -> ... 1')
+                    next_cont_log_prob = rearrange(next_cont_log_prob, '... -> ... 1')
     
-                cont_soft_state_value = next_cont_q_value - learned_entropy_weight * cont_log_prob
+                cont_soft_state_value = next_cont_q_value - learned_entropy_weight * next_cont_log_prob
                 next_soft_state_values.append(cont_soft_state_value)
 
             # then handle discrete contribution
 
             if len(next_discrete_q_values) > 0:
 
-                for next_discrete_q_value, discrete_logit in zip(next_discrete_q_values, discrete_logits):
-                    discrete_prob = discrete_logit.softmax(dim = -1)
-                    discrete_log_prob = log(discrete_prob)
+                for next_discrete_q_value, next_discrete_logit in zip(next_discrete_q_values, next_discrete_logits):
+                    next_discrete_prob = next_discrete_logit.softmax(dim = -1)
+                    next_discrete_log_prob = log(next_discrete_prob)
 
                     if self.quantiled_critics:
-                        discrete_prob = rearrange(discrete_prob, '... -> ... 1')
-                        discrete_log_prob = rearrange(discrete_log_prob, '... -> ... 1')
+                        next_discrete_prob = rearrange(next_discrete_prob, '... -> ... 1')
+                        next_discrete_log_prob = rearrange(next_discrete_log_prob, '... -> ... 1')
 
-                    discrete_soft_state_value = (discrete_prob * (next_discrete_q_value - learned_entropy_weight * discrete_log_prob)).sum(dim = 1)
+                    discrete_soft_state_value = (next_discrete_prob * (next_discrete_q_value - learned_entropy_weight * next_discrete_log_prob)).sum(dim = 1)
                     next_soft_state_values.append(discrete_soft_state_value)
 
         if self.quantiled_critics:
