@@ -798,6 +798,7 @@ class SAC(Module):
         critic_target_ema_decay = 0.99,
         critics_learning_rate = 3e-4,
         critics_regen_reg_rate = 1e-4,
+        use_minto = True,
         multiple_critics_kwargs: dict = dict(),
         temperature_learning_rate = 3e-4,
         ema_kwargs: dict = dict()
@@ -878,6 +879,10 @@ class SAC(Module):
             **ema_kwargs
         )
 
+        # minto - taking the minimum of both online and ema
+
+        self.use_minto = use_minto
+
         # reward related
 
         self.reward_scale = reward_scale
@@ -903,48 +908,63 @@ class SAC(Module):
         γ = self.reward_discount_rate
         not_terminal = (~done).float()
 
+        # outputs from actor for the next states
+
         with torch.no_grad():
-            self.critics_target.eval()
-
-            # outputs from actor for the next states
-
             next_actor_output = self.actor(next_states, sample = True)
 
             next_cont_actions = next_actor_output.continuous
             next_cont_log_prob = next_actor_output.continuous_log_prob
             next_discrete_logits = next_actor_output.discrete_action_logits
 
+            # forward for critic predictions
+            # using EMA, but also using online, if Minto is turned on - Ahmed Hendawy et al. https://arxiv.org/abs/2510.02590
+
+            self.critics_target.eval()
             next_cont_q_value, *next_discrete_q_values = self.critics_target(next_states, cont_actions = next_cont_actions)
 
-            # learned temperature
+            if self.use_minto:
+                was_training = self.critics.training
+                self.critics.eval()
 
-            learned_entropy_weight = self.learned_entropy_temperature.alpha
+                online_next_cont_q_value, *online_next_discrete_q_values = self.critics(next_states, cont_actions = next_cont_actions)
 
-            next_soft_state_values = []
+                next_cont_q_value = torch.minimum(next_cont_q_value, online_next_cont_q_value)
+                next_discrete_q_values = tuple(torch.minimum(*ema_and_online) for ema_and_online in zip(next_discrete_q_values, online_next_discrete_q_values))
 
-            # first handle continuous soft state value
+                self.critics.train(was_training)
 
-            if exists(next_cont_log_prob):
+        # learned temperature
+
+        learned_entropy_weight = self.learned_entropy_temperature.alpha
+
+        next_soft_state_values = []
+
+        # first handle continuous soft state value
+
+        if exists(next_cont_log_prob):
+            if self.quantiled_critics:
+                next_cont_log_prob = rearrange(next_cont_log_prob, '... -> ... 1')
+
+            cont_soft_state_value = next_cont_q_value - learned_entropy_weight * next_cont_log_prob
+            next_soft_state_values.append(cont_soft_state_value)
+
+        # then handle discrete contribution
+
+        if len(next_discrete_q_values) > 0:
+
+            for next_discrete_q_value, next_discrete_logit in zip(next_discrete_q_values, next_discrete_logits):
+                next_discrete_prob = next_discrete_logit.softmax(dim = -1)
+                next_discrete_log_prob = log(next_discrete_prob)
+
                 if self.quantiled_critics:
-                    next_cont_log_prob = rearrange(next_cont_log_prob, '... -> ... 1')
+                    next_discrete_prob = rearrange(next_discrete_prob, '... -> ... 1')
+                    next_discrete_log_prob = rearrange(next_discrete_log_prob, '... -> ... 1')
 
-                cont_soft_state_value = next_cont_q_value - learned_entropy_weight * next_cont_log_prob
-                next_soft_state_values.append(cont_soft_state_value)
+                discrete_soft_state_value = (next_discrete_prob * (next_discrete_q_value - learned_entropy_weight * next_discrete_log_prob)).sum(dim = 1)
+                next_soft_state_values.append(discrete_soft_state_value)
 
-            # then handle discrete contribution
-
-            if len(next_discrete_q_values) > 0:
-
-                for next_discrete_q_value, next_discrete_logit in zip(next_discrete_q_values, next_discrete_logits):
-                    next_discrete_prob = next_discrete_logit.softmax(dim = -1)
-                    next_discrete_log_prob = log(next_discrete_prob)
-
-                    if self.quantiled_critics:
-                        next_discrete_prob = rearrange(next_discrete_prob, '... -> ... 1')
-                        next_discrete_log_prob = rearrange(next_discrete_log_prob, '... -> ... 1')
-
-                    discrete_soft_state_value = (next_discrete_prob * (next_discrete_q_value - learned_entropy_weight * next_discrete_log_prob)).sum(dim = 1)
-                    next_soft_state_values.append(discrete_soft_state_value)
+        # quantile vs not
 
         if self.quantiled_critics:
             next_soft_state_values, _ = pack(next_soft_state_values, 'b * q')
@@ -954,6 +974,8 @@ class SAC(Module):
             next_soft_state_values, _ = pack(next_soft_state_values, 'b *')
             rewards = rearrange(rewards, 'b -> b 1')
             not_terminal = rearrange(not_terminal, 'b -> b 1')
+
+        # target q value
 
         target_q_values = rewards + not_terminal * γ * next_soft_state_values
 

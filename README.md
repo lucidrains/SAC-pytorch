@@ -146,3 +146,27 @@ agent(
     url    = {https://api.semanticscholar.org/CorpusID:268253088}
 }
 ```
+
+```bibtex
+@misc{clavier2024bootstrappingexpectilesreinforcementlearning,
+    title   = {Bootstrapping Expectiles in Reinforcement Learning},
+    author  = {Pierre Clavier and Emmanuel Rachelson and Erwan Le Pennec and Matthieu Geist},
+    year    = {2024},
+    eprint  = {2406.04081},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2406.04081},
+}
+```
+
+```bibtex
+@misc{hendawy2025useonlinenetworkcan,
+    title   = {Use the Online Network If You Can: Towards Fast and Stable Reinforcement Learning},
+    author  = {Ahmed Hendawy and Henrik Metternich and Théo Vincent and Mahdi Kallel and Jan Peters and Carlo D'Eramo},
+    year    = {2025},
+    eprint  = {2510.02590},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2510.02590},
+}
+```
