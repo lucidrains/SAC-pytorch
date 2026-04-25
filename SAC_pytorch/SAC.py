@@ -76,6 +76,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def compact(arr):
     return [*filter(exists, arr)]
 
@@ -224,6 +227,36 @@ class RSMNorm(Module):
 
         return normed
 
+# Simplicial Embeddings
+# Lavoie et al - https://arxiv.org/abs/2204.00616
+# Obando-Ceron et al - https://openreview.net/forum?id=mCpq1GCKxA
+
+class SEM(Module):
+    def __init__(
+        self,
+        dim,
+        temperature = 0.1,
+        dim_simplex = 8,
+        pre_layernorm = False
+    ):
+        super().__init__()
+        assert divisible_by(dim, dim_simplex), f'{dim} must be divisible by {dim_simplex}'
+
+        self.dim = dim
+        self.dim_simplex = dim_simplex
+        self.temperature = temperature
+
+        self.norm = nn.LayerNorm(dim, bias = False) if pre_layernorm else nn.Identity()
+
+    def forward(
+        self,
+        t
+    ):
+        t = self.norm(t)
+        t = rearrange(t, '... (l v) -> ... l v', v = self.dim_simplex)
+        t = (t / self.temperature).softmax(dim = -1)
+        return rearrange(t, '... l v -> ... (l v)')
+
 # SimBa - Kaist + SonyAI research
 
 class ReluSquared(Module):
@@ -241,7 +274,8 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
-        final_norm = False
+        final_norm = False,
+        simplicial_embed = True
     ):
         super().__init__()
         """
@@ -276,7 +310,13 @@ class SimBa(Module):
 
         self.final_norm = nn.LayerNorm(dim_hidden) if final_norm else nn.Identity()
 
-        self.proj_out = nn.Linear(dim_hidden, dim_out)
+        self.simplicial_embed = SEM(dim_hidden, pre_layernorm = not final_norm) if simplicial_embed else nn.Identity()
+
+        self.proj_out = nn.Sequential(
+            nn.Linear(dim_hidden, dim_hidden * 2),
+            nn.LeakyReLU(),
+            nn.Linear(dim_hidden * 2, dim_out)
+        )
 
     def forward(self, x):
 
@@ -287,6 +327,9 @@ class SimBa(Module):
             x = x + orthog_project(layer_out, x)
 
         x = self.final_norm(x)
+
+        x = self.simplicial_embed(x)
+
         return self.proj_out(x)
 
 # distributions
@@ -385,6 +428,7 @@ class Actor(Module):
         eps = 1e-5,
         rsmnorm_input = True,
         use_beta = False,
+        simplicial_embed = False,
         target_range: tuple[float, float] | None = None,
     ):
         super().__init__()
@@ -402,7 +446,8 @@ class Actor(Module):
             dim_state,
             depth = mlp_depth,
             dim_hidden = dim_hidden,
-            dim_out = discrete_action_dims + cont_action_dims
+            dim_out = discrete_action_dims + cont_action_dims,
+            simplicial_embed = simplicial_embed
         )
 
         # continuous distribution
@@ -487,7 +532,8 @@ class Critic(Module):
         dim_hidden = None,
         dropout = 0.,
         dim_out = 1,
-        rsmnorm_input = True
+        rsmnorm_input = True,
+        simplicial_embed = False
     ):
         super().__init__()
 
@@ -507,7 +553,8 @@ class Critic(Module):
             depth = mlp_depth,
             dim_out = critic_dim_out.sum().item(),
             dim_hidden = dim_hidden,
-            dropout = dropout
+            dropout = dropout,
+            simplicial_embed = simplicial_embed
         )
 
         # save the number of quantiles and the number of actions, for splitting out the output of the critic correctly

@@ -182,3 +182,25 @@ agent(
     url     = {https://arxiv.org/abs/2409.04971},
 }
 ```
+
+```bibtex
+@inproceedings{obando-ceron2026simplicial,
+    title   = {Simplicial Embeddings Improve Sample Efficiency in Actor{\textendash}Critic Agents},
+    author  = {Johan Obando-Ceron and Walter Mayor and Samuel Lavoie and Scott Fujimoto and Aaron Courville and Pablo Samuel Castro},
+    booktitle = {The Fourteenth International Conference on Learning Representations},
+    year    = {2026},
+    url     = {https://openreview.net/forum?id=mCpq1GCKxA}
+}
+```
+
+```bibtex
+@misc{lavoie2022simplicialembeddingsselfsupervisedlearning,
+    title   = {Simplicial Embeddings in Self-Supervised Learning and Downstream Classification},
+    author  = {Samuel Lavoie and Christos Tsirigotis and Max Schwarzer and Ankit Vani and Michael Noukhovitch and Kenji Kawaguchi and Aaron Courville},
+    year    = {2022},
+    eprint  = {2204.00616},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2204.00616},
+}
+```

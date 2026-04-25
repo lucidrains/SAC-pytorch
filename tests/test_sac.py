@@ -4,7 +4,11 @@ param = pytest.mark.parametrize
 import torch
 
 @param('use_beta', (False, True))
-def test_sac(use_beta):
+@param('simplicial_embed', (False, True))
+def test_sac(
+    use_beta,
+    simplicial_embed
+):
 
     from SAC_pytorch import (
         SAC,
@@ -32,6 +36,8 @@ def test_sac(use_beta):
         num_cont_actions = 2,
         num_discrete_actions = (5, 5),
         use_beta = use_beta,
+        simplicial_embed = simplicial_embed,
+        dim_hidden = 24,
         target_range = (-2., 2.)
     )
 

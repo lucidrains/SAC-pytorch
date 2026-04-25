@@ -57,8 +57,10 @@ def main(
     target_reward:          float = 25.,
     rolling_window:         int = 20,
     num_critics:            int = 2,
+    dim_hidden:             int = 384,
     expectile_l2_loss_tau:  float = 0.45,
-    use_beta:               bool = False
+    use_beta:               bool = False,
+    simplicial_embed:       bool = True
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -100,14 +102,15 @@ def main(
         dim_state = state_dim,
         num_cont_actions = num_cont_actions,
         num_discrete_actions = num_discrete_actions,
-        dim_hidden = 256,
-        mlp_depth = 2
+        dim_hidden = dim_hidden,
+        mlp_depth = 3,
+        simplicial_embed = simplicial_embed
     )
 
     actor_kwargs = dict(
         **actor_critic_kwargs,
         use_beta = use_beta,
-        target_range = (-1., 1.)
+        target_range = (-1., 1.),
     )
 
     actor = Actor(**actor_kwargs)
