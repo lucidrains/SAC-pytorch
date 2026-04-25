@@ -7,7 +7,7 @@ from collections import namedtuple
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.distributions import Normal
+from torch.distributions import Normal, Beta
 from torch import nn, einsum, Tensor, tensor, cat, stack
 from torch.nn import Module, ModuleList, Sequential
 
@@ -63,6 +63,7 @@ SoftActorOutput = namedtuple('SoftActorOutput', [
 SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', [
     'continuous',
     'continuous_log_prob',
+    'continuous_entropy',
     'discrete',
     'discrete_action_logits',
 ])
@@ -288,6 +289,87 @@ class SimBa(Module):
         x = self.final_norm(x)
         return self.proj_out(x)
 
+# distributions
+
+def get_scale(source_range, target_range):
+    source_min, source_max = source_range
+    target_min, target_max = target_range
+    return (target_max - target_min) / (source_max - source_min)
+
+def rescale_from_to(t, source_range, target_range):
+    source_min, _ = source_range
+    target_min, _ = target_range
+    scale = get_scale(source_range, target_range)
+    return (t - source_min) * scale + target_min
+
+class SquashedNormal(Module):
+    def __init__(self, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.source_range = (-1., 1.)
+
+    def process_params(self, params):
+        mu, sigma = rearrange(params, '... (n mu_sigma) -> mu_sigma ... n', mu_sigma = 2)
+        sigma = sigma.sigmoid().clamp(min = self.eps)
+        return ContinuousOutput(mu, sigma)
+
+    def forward(self, params, reparametrize = False):
+        mu, sigma = self.process_params(params)
+
+        if reparametrize:
+            sampled = mu + sigma * torch.randn_like(sigma)
+        else:
+            sampled = torch.normal(mu, sigma)
+
+        squashed = sampled.tanh()
+
+        # log prob
+
+        log_prob = Normal(mu, sigma).log_prob(sampled)
+        log_prob = log_prob - 2 * (log(tensor(2.)) - sampled - F.softplus(-2 * sampled))
+
+        # approximate entropy
+
+        entropy = -log_prob
+
+        return squashed, log_prob, entropy, self.source_range
+
+class BetaDistribution(Module):
+    def __init__(self, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.source_range = (0., 1.)
+
+    def process_params(self, params):
+        alpha, beta = rearrange(params, '... (n alpha_beta) -> alpha_beta ... n', alpha_beta = 2)
+
+        # unimodal
+
+        alpha = F.softplus(alpha) + 1. + self.eps
+        beta = F.softplus(beta) + 1. + self.eps
+        return ContinuousOutput(alpha, beta)
+
+    def forward(self, params, reparametrize = False):
+        alpha, beta = self.process_params(params)
+
+        dist = Beta(alpha, beta)
+
+        if not reparametrize:
+            sampled = dist.sample()
+        else:
+            sampled = dist.rsample()
+
+        # log prob
+
+        sampled_for_log_prob = sampled.clamp(min = self.eps, max = 1. - self.eps)
+        log_prob = dist.log_prob(sampled_for_log_prob)
+
+        # entropy
+
+        entropy = dist.entropy()
+
+        return sampled, log_prob, entropy, self.source_range
+
 # main modules
 
 class Actor(Module):
@@ -301,7 +383,9 @@ class Actor(Module):
         num_discrete_actions: tuple[int, ...] = (),
         dim_hidden = None,
         eps = 1e-5,
-        rsmnorm_input = True
+        rsmnorm_input = True,
+        use_beta = False,
+        target_range: tuple[float, float] | None = None,
     ):
         super().__init__()
         self.eps = eps
@@ -321,6 +405,12 @@ class Actor(Module):
             dim_out = discrete_action_dims + cont_action_dims
         )
 
+        # continuous distribution
+
+        cont_klass = BetaDistribution if use_beta else SquashedNormal
+        self.cont_dist = cont_klass(eps = eps)
+
+        self.target_range = target_range
 
     def forward(
         self,
@@ -341,28 +431,21 @@ class Actor(Module):
         discrete_actions, cont_actions = action_dims.split(self.split_dims, dim = -1)
         discrete_action_logits = discrete_actions.split(self.num_discrete_actions, dim = -1)
 
-        mu, sigma = rearrange(cont_actions, '... (n mu_sigma) -> mu_sigma ... n', mu_sigma = 2)
-        sigma = sigma.sigmoid().clamp(min = self.eps)
-
-        cont_output = ContinuousOutput(mu, sigma)
-        discrete_output = discrete_action_logits
-
         if not sample:
-            return SoftActorOutput(cont_output, discrete_output)
+            cont_output = self.cont_dist.process_params(cont_actions)
+            return SoftActorOutput(cont_output, discrete_action_logits)
 
         # handle continuous
 
-        if cont_reparametrize:
-            sampled_cont_actions = mu + sigma * torch.randn_like(sigma)
-        else:
-            sampled_cont_actions = torch.normal(mu, sigma)
+        sampled_cont_actions, cont_log_prob, cont_entropy, source_range = self.cont_dist(cont_actions, reparametrize = cont_reparametrize)
 
-        squashed_cont_actions = sampled_cont_actions.tanh() # tanh squashing
+        if exists(self.target_range) and self.target_range != source_range:
+            sampled_cont_actions = rescale_from_to(sampled_cont_actions, source_range, self.target_range)
 
-        cont_log_prob = Normal(mu, sigma).log_prob(sampled_cont_actions)
-        cont_log_prob = cont_log_prob - 2 * (log(tensor(2.)) - sampled_cont_actions - F.softplus(-2 * sampled_cont_actions))
+            scale = get_scale(source_range, self.target_range)
 
-        scaled_squashed_cont_actions = squashed_cont_actions * self.num_cont_actions
+            cont_log_prob = cont_log_prob - math.log(scale)
+            cont_entropy = cont_entropy + math.log(scale)
 
         # handle discrete
 
@@ -385,8 +468,9 @@ class Actor(Module):
         # return all sampled continuous and discrete actions with their associated log prob
 
         return SampledSoftActorOutput(
-            scaled_squashed_cont_actions,
+            sampled_cont_actions,
             cont_log_prob,
+            cont_entropy,
             stack(sampled_discrete_actions, dim = -1) if len(sampled_discrete_actions) > 0 else None,
             discrete_action_logits
         )
@@ -401,7 +485,6 @@ class Critic(Module):
         mlp_depth = 3,
         num_discrete_actions: tuple[int, ...] = (),
         dim_hidden = None,
-        layernorm = False,
         dropout = 0.,
         dim_out = 1,
         rsmnorm_input = True
@@ -743,11 +826,11 @@ class LearnedEntropyTemperature(Module):
 
     def forward(
         self,
-        cont_log_prob: Float['b nc'] | None = None,
+        cont_entropy: Float['b nc'] | None = None,
         discrete_logits: tuple[Float['b _'], ...] | None = None,
         return_breakdown = False
     ):
-        assert exists(cont_log_prob) or exists(discrete_logits)
+        assert exists(cont_entropy) or exists(discrete_logits)
 
         alpha = self.alpha
 
@@ -756,13 +839,13 @@ class LearnedEntropyTemperature(Module):
         if exists(discrete_logits):
 
             for one_discrete_logits, discrete_entropy_target in zip(discrete_logits, self.discrete_entropy_targets):
-                discrete_log_prob = one_discrete_logits.log_softmax(dim = -1)
-                discrete_entropy_temp_loss = -alpha * (discrete_log_prob + discrete_entropy_target).detach()
+                discrete_entropy = entropy(one_discrete_logits)
+                discrete_entropy_temp_loss = -alpha * (discrete_entropy_target - discrete_entropy).detach()
 
                 losses.append(discrete_entropy_temp_loss.mean())
 
-        if exists(cont_log_prob):
-            cont_entropy_temp_loss = -alpha * (cont_log_prob + self.continuous_entropy_target).detach()
+        if exists(cont_entropy):
+            cont_entropy_temp_loss = -alpha * (self.continuous_entropy_target - cont_entropy).detach()
 
             cont_entropy_temp_loss = cont_entropy_temp_loss.mean(dim = 0)
             losses.append(cont_entropy_temp_loss)
@@ -798,7 +881,7 @@ class SAC(Module):
         critic_target_ema_decay = 0.99,
         critics_learning_rate = 3e-4,
         critics_regen_reg_rate = 1e-4,
-        use_minto = True,
+        use_minto = False,
         multiple_critics_kwargs: dict = dict(),
         temperature_learning_rate = 3e-4,
         ema_kwargs: dict = dict()
@@ -943,6 +1026,8 @@ class SAC(Module):
         # first handle continuous soft state value
 
         if exists(next_cont_log_prob):
+            next_cont_log_prob = next_cont_log_prob.sum(dim = -1, keepdim = True)
+
             if self.quantiled_critics:
                 next_cont_log_prob = rearrange(next_cont_log_prob, '... -> ... 1')
 
@@ -996,7 +1081,7 @@ class SAC(Module):
 
         actor_output = self.actor(states, sample = True, cont_reparametrize = True)
 
-        cont_log_prob = actor_output.continuous_log_prob
+        cont_entropy = actor_output.continuous_entropy
         discrete_logits = actor_output.discrete_action_logits
 
         cont_q_values, *discrete_q_values = self.critics(
@@ -1008,8 +1093,9 @@ class SAC(Module):
 
         actor_action_losses = []
 
-        if exists(cont_log_prob):
-            cont_action_loss = (entropy_temp * cont_log_prob - cont_q_values).sum(dim = -1).mean()
+        if exists(cont_entropy):
+            cont_entropy_summed = cont_entropy.sum(dim = -1, keepdim = True)
+            cont_action_loss = (-entropy_temp * cont_entropy_summed - cont_q_values).mean()
 
             actor_action_losses.append(cont_action_loss)
 
@@ -1017,7 +1103,7 @@ class SAC(Module):
             discrete_prob = discrete_logit.softmax(dim = -1)
             discrete_log_prob = log(discrete_prob)
 
-            one_discrete_actor_loss = (discrete_prob * (entropy_temp * discrete_log_prob - one_discrete_q_value)).mean()
+            one_discrete_actor_loss = (discrete_prob * (entropy_temp * discrete_log_prob - one_discrete_q_value)).sum(dim = -1).mean()
 
             actor_action_losses.append(one_discrete_actor_loss)
 
@@ -1028,7 +1114,7 @@ class SAC(Module):
         # update the learned entropy temperature
 
         temperature_loss = self.learned_entropy_temperature(
-            cont_log_prob = cont_log_prob,
+            cont_entropy = cont_entropy,
             discrete_logits = discrete_logits
         )
 

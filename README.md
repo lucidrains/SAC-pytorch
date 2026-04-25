@@ -39,7 +39,7 @@ agent = SAC(
 )
 
 state = torch.randn(3, 5)
-cont_actions, cont_logprob, discrete, discrete_logprob = actor(state, sample = True)
+cont_actions, cont_logprob, cont_entropy, discrete, discrete_logprob = actor(state, sample = True)
 
 agent(
     states = state,
@@ -168,5 +168,17 @@ agent(
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2510.02590},
+}
+```
+
+```bibtex
+@misc{dellalibera2024softactorcriticbetapolicy,
+    title   = {Soft Actor-Critic with Beta Policy via Implicit Reparameterization Gradients},
+    author  = {Luca Della Libera},
+    year    = {2024},
+    eprint  = {2409.04971},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2409.04971},
 }
 ```

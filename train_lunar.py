@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+
 import shutil
 from collections import deque
 
@@ -56,6 +58,7 @@ def main(
     rolling_window:         int = 20,
     num_critics:            int = 2,
     expectile_l2_loss_tau:  float = 0.45,
+    use_beta:               bool = False
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -101,7 +104,13 @@ def main(
         mlp_depth = 2
     )
 
-    actor = Actor(**actor_critic_kwargs)
+    actor_kwargs = dict(
+        **actor_critic_kwargs,
+        use_beta = use_beta,
+        target_range = (-1., 1.)
+    )
+
+    actor = Actor(**actor_kwargs)
 
     critics = [Critic(**actor_critic_kwargs, dim_out = 1) for _ in range(num_critics)]
 
@@ -173,7 +182,7 @@ def main(
 
                     if continuous:
                         action_raw = actor_output.continuous[0].cpu().numpy()
-                        action_env = np.clip(action_raw / num_cont_actions, -1., 1.)
+                        action_env = np.clip(action_raw, -1., 1.)
                         action_store = action_env
                     else:
                         action_raw = actor_output.discrete[0].cpu().numpy()
@@ -218,7 +227,7 @@ def main(
                 for states, actions, rewards, dones, next_states in tqdm(dl, desc = 'Updating', leave = False):
 
                     if continuous:
-                        cont_actions = actions * num_cont_actions
+                        cont_actions = actions
                         discrete_actions = None
                     else:
                         cont_actions = None

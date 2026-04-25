@@ -1,7 +1,11 @@
 import pytest
+param = pytest.mark.parametrize
+
 import torch
 
-def test_sac():
+@param('use_beta', (False, True))
+def test_sac(use_beta):
+
     from SAC_pytorch import (
         SAC,
         Actor,
@@ -26,7 +30,9 @@ def test_sac():
     actor = Actor(
         dim_state = 5,
         num_cont_actions = 2,
-        num_discrete_actions = (5, 5)
+        num_discrete_actions = (5, 5),
+        use_beta = use_beta,
+        target_range = (-2., 2.)
     )
 
     agent = SAC(
@@ -36,7 +42,8 @@ def test_sac():
     )
 
     state = torch.randn(3, 5)
-    cont_actions, cont_logprob, discrete, discrete_logprob = actor(state, sample = True)
+
+    cont_actions, cont_logprob, cont_entropy, discrete, discrete_logprob = actor(state, sample = True)
 
     agent(
         states = state,
