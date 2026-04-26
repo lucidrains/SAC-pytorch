@@ -60,7 +60,8 @@ def main(
     dim_hidden:             int = 384,
     expectile_l2_loss_tau:  float = 0.45,
     use_beta:               bool = False,
-    simplicial_embed:       bool = True
+    simplicial_embed:       bool = True,
+    fire_every:             int | None = None
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -130,7 +131,8 @@ def main(
         temperature_learning_rate = learning_rate,
         actor_regen_reg_rate = 0.,
         critics_regen_reg_rate = 0.,
-        reward_scale = 2.
+        reward_scale = 2.,
+        fire_every = fire_every
     )
 
     agent.to(device)

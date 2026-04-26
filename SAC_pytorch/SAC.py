@@ -149,6 +149,35 @@ def orthog_project(x, y):
 
     return orthog.to(dtype)
 
+# FIRE - Frobenius-Isometry Reinitialization
+# Han et al. https://arxiv.org/abs/2602.08040
+
+@torch.no_grad()
+def apply_fire(
+    module,
+    num_iters = 20,
+    coefs = (1.5, -0.5)
+):
+    a, b = coefs
+
+    for p in module.parameters():
+        if p.ndim != 2:
+            continue
+
+        t = p.data
+        t_norm = t.norm()
+
+        if t_norm == 0.:
+            continue
+
+        t = t / t_norm
+
+        for _ in range(num_iters):
+            A = t.T @ t
+            t = a * t + b * (t @ A)
+
+        p.data.copy_(t)
+
 # distributed helpers
 
 def is_distributed():
@@ -931,7 +960,12 @@ class SAC(Module):
         use_minto = False,
         multiple_critics_kwargs: dict = dict(),
         temperature_learning_rate = 3e-4,
-        ema_kwargs: dict = dict()
+        ema_kwargs: dict = dict(),
+        actor_update_freq = 2,
+        fire_every: int | None = None,
+        apply_fire_actor: bool = True,
+        apply_fire_critic: bool = True,
+        fire_num_iters: int = 20
     ):
         super().__init__()
 
@@ -1017,6 +1051,34 @@ class SAC(Module):
 
         self.reward_scale = reward_scale
         self.reward_discount_rate = reward_discount_rate
+
+        # maybe fire
+
+        self.fire_every = fire_every
+        self.apply_fire_actor = apply_fire_actor
+        self.apply_fire_critic = apply_fire_critic
+        self.fire_num_iters = fire_num_iters
+
+        # steps and frequency of actor update
+
+        self.actor_update_freq = actor_update_freq
+        self.register_buffer('step', tensor(0))
+
+    @torch.no_grad()
+    def apply_fire_(
+        self,
+        num_iters = 20,
+        coefs = (1.5, -0.5)
+    ):
+        if self.apply_fire_actor:
+            apply_fire(self.actor, num_iters = num_iters, coefs = coefs)
+
+        if self.apply_fire_critic:
+            for critic in self.critics.critics:
+                apply_fire(critic, num_iters = num_iters, coefs = coefs)
+
+            if exists(self.critics_target):
+                self.critics_target.copy_params_from_model_to_ema()
 
     def forward(
         self,
@@ -1124,51 +1186,62 @@ class SAC(Module):
         self.critics_optimizer.step()
         self.critics_optimizer.zero_grad()
 
-        # update the actor
+        if divisible_by(int(self.step.item()), self.actor_update_freq):
 
-        actor_output = self.actor(states, sample = True, cont_reparametrize = True)
+            # update the actor
 
-        cont_entropy = actor_output.continuous_entropy
-        discrete_logits = actor_output.discrete_action_logits
+            actor_output = self.actor(states, sample = True, cont_reparametrize = True)
 
-        cont_q_values, *discrete_q_values = self.critics(
-            states,
-            cont_actions = actor_output.continuous,
-            discrete_actions = actor_output.discrete,
-            truncate_quantiles_across_critics = True
-        )
+            cont_entropy = actor_output.continuous_entropy
+            discrete_logits = actor_output.discrete_action_logits
 
-        actor_action_losses = []
+            cont_q_values, *discrete_q_values = self.critics(
+                states,
+                cont_actions = actor_output.continuous,
+                discrete_actions = actor_output.discrete,
+                truncate_quantiles_across_critics = True
+            )
 
-        if exists(cont_entropy):
-            cont_entropy_summed = cont_entropy.sum(dim = -1, keepdim = True)
-            cont_action_loss = (-entropy_temp * cont_entropy_summed - cont_q_values).mean()
+            actor_action_losses = []
 
-            actor_action_losses.append(cont_action_loss)
+            if exists(cont_entropy):
+                cont_entropy_summed = cont_entropy.sum(dim = -1, keepdim = True)
+                cont_action_loss = (-entropy_temp * cont_entropy_summed - cont_q_values).mean()
 
-        for discrete_logit, one_discrete_q_value in zip(discrete_logits, discrete_q_values):
-            discrete_prob = discrete_logit.softmax(dim = -1)
-            discrete_log_prob = log(discrete_prob)
+                actor_action_losses.append(cont_action_loss)
 
-            one_discrete_actor_loss = (discrete_prob * (entropy_temp * discrete_log_prob - one_discrete_q_value)).sum(dim = -1).mean()
+            for discrete_logit, one_discrete_q_value in zip(discrete_logits, discrete_q_values):
+                discrete_prob = discrete_logit.softmax(dim = -1)
+                discrete_log_prob = log(discrete_prob)
 
-            actor_action_losses.append(one_discrete_actor_loss)
+                one_discrete_actor_loss = (discrete_prob * (entropy_temp * discrete_log_prob - one_discrete_q_value)).sum(dim = -1).mean()
 
-        sum(actor_action_losses).backward()
-        self.actor_optimizer.step()
-        self.actor_optimizer.zero_grad()
+                actor_action_losses.append(one_discrete_actor_loss)
 
-        # update the learned entropy temperature
+            sum(actor_action_losses).backward()
+            self.actor_optimizer.step()
+            self.actor_optimizer.zero_grad()
 
-        temperature_loss = self.learned_entropy_temperature(
-            cont_entropy = cont_entropy,
-            discrete_logits = discrete_logits
-        )
+            # update the learned entropy temperature
 
-        temperature_loss.backward()
-        self.temperature_optimizer.step()
-        self.temperature_optimizer.zero_grad()
+            temperature_loss = self.learned_entropy_temperature(
+                cont_entropy = cont_entropy,
+                discrete_logits = discrete_logits
+            )
 
-        # update ema of all critics
+            temperature_loss.backward()
+            self.temperature_optimizer.step()
+            self.temperature_optimizer.zero_grad()
+
+        # increment step, update ema
+
+        self.step.add_(1)
 
         self.critics_target.update()
+
+        # maybe fire
+
+        step = int(self.step.item())
+
+        if exists(self.fire_every) and step > 0 and divisible_by(step, self.fire_every):
+            self.apply_fire_(num_iters = self.fire_num_iters)

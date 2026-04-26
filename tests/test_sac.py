@@ -44,18 +44,20 @@ def test_sac(
     agent = SAC(
         actor = actor,
         critics = [critic1, critic2],
-        quantiled_critics = True
+        quantiled_critics = True,
+        fire_every = 5
     )
 
-    state = torch.randn(3, 5)
+    for _ in range(10):
+        state = torch.randn(3, 5)
 
-    cont_actions, cont_logprob, cont_entropy, discrete, discrete_logprob = actor(state, sample = True)
+        cont_actions, cont_logprob, cont_entropy, discrete, discrete_logprob = actor(state, sample = True)
 
-    agent(
-        states = state,
-        cont_actions = cont_actions,
-        discrete_actions = discrete,
-        rewards = torch.randn(1),
-        done = torch.zeros(1).bool(),
-        next_states = state + 1
-    )
+        agent(
+            states = state,
+            cont_actions = cont_actions,
+            discrete_actions = discrete,
+            rewards = torch.randn(1),
+            done = torch.zeros(1).bool(),
+            next_states = state + 1
+        )

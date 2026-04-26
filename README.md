@@ -204,3 +204,27 @@ agent(
     url     = {https://arxiv.org/abs/2204.00616},
 }
 ```
+
+```bibtex
+@misc{fujimoto2018addressingfunctionapproximationerror,
+    title   = {Addressing Function Approximation Error in Actor-Critic Methods},
+    author  = {Scott Fujimoto and Herke van Hoof and David Meger},
+    year    = {2018},
+    eprint  = {1802.09477},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.AI},
+    url     = {https://arxiv.org/abs/1802.09477},
+}
+```
+
+```bibtex
+@misc{han2026firefrobeniusisometryreinitializationbalancing,
+    title   = {FIRE: Frobenius-Isometry Reinitialization for Balancing the Stability-Plasticity Tradeoff},
+    author  = {Isaac Han and Sangyeon Park and Seungwon Oh and Donghu Kim and Hojoon Lee and Kyung-Joong Kim},
+    year    = {2026},
+    eprint  = {2602.08040},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2602.08040},
+}
+```
