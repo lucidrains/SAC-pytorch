@@ -156,7 +156,9 @@ def orthog_project(x, y):
 def apply_fire(
     module,
     num_iters = 20,
-    coefs = (1.5, -0.5)
+    coefs = (1.5, -0.5),
+    shrink_perturb = False,
+    shrink_perturb_factors = (0.5, 0.01)
 ):
     a, b = coefs
 
@@ -175,6 +177,12 @@ def apply_fire(
         for _ in range(num_iters):
             A = t.T @ t
             t = a * t + b * (t @ A)
+
+        if shrink_perturb:
+            scale, noise_scale = shrink_perturb_factors
+            noise = torch.randn_like(t)
+
+            t = t.mul_(1. - scale).add_(noise * noise_scale)
 
         p.data.copy_(t)
 
@@ -963,9 +971,11 @@ class SAC(Module):
         ema_kwargs: dict = dict(),
         actor_update_freq = 2,
         fire_every: int | None = None,
-        apply_fire_actor: bool = True,
-        apply_fire_critic: bool = True,
-        fire_num_iters: int = 20
+        apply_fire_actor = True,
+        apply_fire_critic = True,
+        fire_num_iters = 20,
+        shrink_perturb = False,
+        shrink_perturb_factors = (0.5, 0.01)
     ):
         super().__init__()
 
@@ -1052,12 +1062,15 @@ class SAC(Module):
         self.reward_scale = reward_scale
         self.reward_discount_rate = reward_discount_rate
 
-        # maybe fire
+        # continual learning related - shrink & perturb + fire
 
         self.fire_every = fire_every
         self.apply_fire_actor = apply_fire_actor
         self.apply_fire_critic = apply_fire_critic
         self.fire_num_iters = fire_num_iters
+
+        self.shrink_perturb = shrink_perturb
+        self.shrink_perturb_factors = shrink_perturb_factors
 
         # steps and frequency of actor update
 
@@ -1068,14 +1081,16 @@ class SAC(Module):
     def apply_fire_(
         self,
         num_iters = 20,
-        coefs = (1.5, -0.5)
+        coefs = (1.5, -0.5),
+        shrink_perturb = False,
+        shrink_perturb_factors = (0.5, 0.01)
     ):
         if self.apply_fire_actor:
-            apply_fire(self.actor, num_iters = num_iters, coefs = coefs)
+            apply_fire(self.actor, num_iters = num_iters, coefs = coefs, shrink_perturb = shrink_perturb, shrink_perturb_factors = shrink_perturb_factors)
 
         if self.apply_fire_critic:
             for critic in self.critics.critics:
-                apply_fire(critic, num_iters = num_iters, coefs = coefs)
+                apply_fire(critic, num_iters = num_iters, coefs = coefs, shrink_perturb = shrink_perturb, shrink_perturb_factors = shrink_perturb_factors)
 
             if exists(self.critics_target):
                 self.critics_target.copy_params_from_model_to_ema()

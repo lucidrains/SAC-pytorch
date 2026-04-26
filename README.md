@@ -228,3 +228,15 @@ agent(
     url     = {https://arxiv.org/abs/2602.08040},
 }
 ```
+
+```bibtex
+@misc{juliani2024studyplasticitylossonpolicy,
+    title   = {A Study of Plasticity Loss in On-Policy Deep Reinforcement Learning},
+    author  = {Arthur Juliani and Jordan T. Ash},
+    year    = {2024},
+    eprint  = {2405.19153},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2405.19153},
+}
+```
