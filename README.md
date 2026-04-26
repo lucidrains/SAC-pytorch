@@ -1,6 +1,6 @@
 ## SAC (Soft Actor Critic) - Pytorch
 
-Implementation of Soft Actor Critic and some of its improvements in Pytorch. Interest comes from watching <a href="https://www.youtube.com/watch?v=17NrtKHdPDw">this lecture</a>
+Implementation of Soft Actor Critic and some of its improvements in Pytorch. Interest comes from watching <a href="https://www.youtube.com/watch?v=17NrtKHdPDw">this lecture</a> and <a href="https://www.nature.com/articles/s41586-026-10338-5">Ace</a> from SonyAI
 
 ```python
 import torch
