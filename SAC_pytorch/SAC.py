@@ -57,8 +57,9 @@ ContinuousOutput = namedtuple('ContinuousOutput', [
 
 SoftActorOutput = namedtuple('SoftActorOutput', [
     'continuous',
-    'discrete'
-])
+    'discrete',
+    'state_recon'
+], defaults=(None,))
 
 SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', [
     'continuous',
@@ -66,7 +67,8 @@ SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', [
     'continuous_entropy',
     'discrete',
     'discrete_action_logits',
-])
+    'state_recon'
+], defaults=(None,))
 
 # helpers
 
@@ -204,66 +206,6 @@ def maybe_distributed_mean(t):
 def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
 
-# RSM Norm (not to be confused with RMSNorm from transformers)
-# this was proposed by SimBa https://arxiv.org/abs/2410.09754
-# experiments show this to outperform other types of normalization
-
-class RSMNorm(Module):
-    def __init__(
-        self,
-        dim,
-        eps = 1e-5,
-        time_dilate_factor = 1.,
-    ):
-        # equation (3) in https://arxiv.org/abs/2410.09754
-        super().__init__()
-        self.dim = dim
-        self.eps = 1e-5
-
-        self.time_dilate_factor = time_dilate_factor
-
-        self.register_buffer('step', tensor(1))
-        self.register_buffer('running_mean', torch.zeros(dim))
-        self.register_buffer('running_variance', torch.ones(dim))
-
-    def reset_step(self):
-        self.step.zero_()
-
-    @property
-    def time(self):
-        return self.step / self.time_dilate_factor
-
-    def forward(
-        self,
-        x
-    ):
-        assert x.shape[-1] == self.dim, f'expected feature dimension of {self.dim} but received {x.shape[-1]}'
-
-        time = self.time.item()
-        mean = self.running_mean
-        variance = self.running_variance
-
-        normed = (x - mean) / variance.sqrt().clamp(min = self.eps)
-
-        if not self.training:
-            return normed
-
-        # update running mean and variance
-
-        with torch.no_grad():
-
-            new_obs_mean = maybe_distributed_mean(reduce(x, '... d -> d', 'mean'))
-            delta = new_obs_mean - mean
-
-            new_mean = mean + delta / time
-            new_variance = (time - 1) / time * (variance + (delta ** 2) / time)
-
-            self.step.add_(1)
-            self.running_mean.copy_(new_mean)
-            self.running_variance.copy_(new_variance)
-
-        return normed
-
 # Simplicial Embeddings
 # Lavoie et al - https://arxiv.org/abs/2204.00616
 # Obando-Ceron et al - https://openreview.net/forum?id=mCpq1GCKxA
@@ -355,19 +297,32 @@ class SimBa(Module):
             nn.Linear(dim_hidden * 2, dim_out)
         )
 
-    def forward(self, x):
+    def forward(self, x, return_all_layers = False):
 
         x = self.proj_in(x)
+
+        layers = []
 
         for layer in self.layers:
             layer_out = layer(x)
             x = x + orthog_project(layer_out, x)
 
+            if return_all_layers:
+                layers.append(x)
+
         x = self.final_norm(x)
 
         x = self.simplicial_embed(x)
 
-        return self.proj_out(x)
+        if return_all_layers:
+            layers.append(x)
+
+        out = self.proj_out(x)
+
+        if not return_all_layers:
+            return out
+
+        return out, layers
 
 # distributions
 
@@ -463,14 +418,15 @@ class Actor(Module):
         num_discrete_actions: tuple[int, ...] = (),
         dim_hidden = None,
         eps = 1e-5,
-        rsmnorm_input = True,
         use_beta = False,
         simplicial_embed = False,
         target_range: tuple[float, float] | None = None,
+        state_recon = False,
+        state_recon_branch_layer = -1,
+        state_recon_module: Module | None = None
     ):
         super().__init__()
         self.eps = eps
-        self.rsmnorm = RSMNorm(dim_state) if rsmnorm_input else nn.Identity()
 
         discrete_action_dims = sum(num_discrete_actions)
         cont_action_dims = num_cont_actions * 2
@@ -494,6 +450,22 @@ class Actor(Module):
 
         self.target_range = target_range
 
+        # state reconstruction auxiliary loss
+        # used by SonyAI for their SAC actor
+
+        self.state_recon = state_recon
+        self.state_recon_branch_layer = state_recon_branch_layer
+
+        if state_recon:
+            recon_dim_hidden = default(dim_hidden, dim_state * 2)
+
+            self.to_state_recon = default(state_recon_module, Sequential(
+                SEM(recon_dim_hidden, pre_layernorm = True),
+                nn.Linear(recon_dim_hidden, recon_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(recon_dim_hidden, dim_state)
+            ))
+
     def forward(
         self,
         state: Float['b ...'],
@@ -506,16 +478,20 @@ class Actor(Module):
         SampledSoftActorOutput
     ):
 
-        state = self.rsmnorm(state)
-
-        action_dims = self.to_actions(state)
+        if self.state_recon:
+            action_dims, embeds = self.to_actions(state, return_all_layers = True)
+            embed = embeds[self.state_recon_branch_layer]
+            state_recon = self.to_state_recon(embed)
+        else:
+            action_dims = self.to_actions(state)
+            state_recon = None
 
         discrete_actions, cont_actions = action_dims.split(self.split_dims, dim = -1)
         discrete_action_logits = discrete_actions.split(self.num_discrete_actions, dim = -1)
 
         if not sample:
             cont_output = self.cont_dist.process_params(cont_actions)
-            return SoftActorOutput(cont_output, discrete_action_logits)
+            return SoftActorOutput(cont_output, discrete_action_logits, state_recon)
 
         # handle continuous
 
@@ -554,7 +530,8 @@ class Actor(Module):
             cont_log_prob,
             cont_entropy,
             stack(sampled_discrete_actions, dim = -1) if len(sampled_discrete_actions) > 0 else None,
-            discrete_action_logits
+            discrete_action_logits,
+            state_recon
         )
 
 class Critic(Module):
@@ -569,12 +546,12 @@ class Critic(Module):
         dim_hidden = None,
         dropout = 0.,
         dim_out = 1,
-        rsmnorm_input = True,
-        simplicial_embed = False
+        simplicial_embed = False,
+        state_recon = False,
+        state_recon_branch_layer = -1,
+        state_recon_module: Module | None = None
     ):
         super().__init__()
-
-        self.rsmnorm = RSMNorm(dim_state) if rsmnorm_input else nn.Identity()
 
         dim_out = default(dim_out, dim_state)
 
@@ -594,6 +571,21 @@ class Critic(Module):
             simplicial_embed = simplicial_embed
         )
 
+        # state reconstruction auxiliary loss
+
+        self.state_recon = state_recon
+        self.state_recon_branch_layer = state_recon_branch_layer
+
+        if state_recon:
+            recon_dim_hidden = default(dim_hidden, (dim_state + num_cont_actions) * 2)
+
+            self.to_state_recon = default(state_recon_module, Sequential(
+                SEM(recon_dim_hidden, pre_layernorm = True),
+                nn.Linear(recon_dim_hidden, recon_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(recon_dim_hidden, dim_state)
+            ))
+
         # save the number of quantiles and the number of actions, for splitting out the output of the critic correctly
 
         self.num_actions_split = num_actions_split.tolist()
@@ -611,13 +603,16 @@ class Critic(Module):
         cont_actions: Float['b {self._n}'] | None = None
     ) -> tuple[Float['b ...'], ...]:
 
-        state = self.rsmnorm(state)
-
         pack_input = compact([state, cont_actions])
 
         mlp_input, _ = pack(pack_input, 'b *')
 
-        values = self.to_values(mlp_input)
+        if self.state_recon:
+            values, embeds = self.to_values(mlp_input, return_all_layers = True)
+            embed = embeds[self.state_recon_branch_layer]
+            state_recon = self.to_state_recon(embed)
+        else:
+            values = self.to_values(mlp_input)
 
         greater_one_output_dim = self.dim_out > 1
 
@@ -628,6 +623,8 @@ class Critic(Module):
 
         values = values.split(self.num_actions_split, dim = split_dim)
 
+        if self.state_recon:
+            return values, state_recon
         return values
 
 class MultipleCritics(Module):
@@ -636,7 +633,9 @@ class MultipleCritics(Module):
         self,
         *critics: Critic,
         use_softmin = False,
-        expectile_l2_loss_tau = 0.5 # regular mse loss if 0.5
+        expectile_l2_loss_tau = 0.5, # regular mse loss if 0.5
+        state_recon_loss_weight = 1.0,
+        state_recon_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
         assert len(critics) > 0
@@ -645,6 +644,15 @@ class MultipleCritics(Module):
         self.num_critics = len(critics)
         self.one_critic = len(critics) == 1
         self.critics = ModuleList(critics)
+
+        # maybe state recon loss
+
+        has_state_recons = tuple(critic.state_recon for critic in critics)
+        assert len(set(has_state_recons)) == 1, 'critics must all have state_recon either enabled or disabled'
+        self.has_state_recon = has_state_recons[0]
+
+        self.state_recon_loss_weight = state_recon_loss_weight
+        self.state_recon_loss_fn = state_recon_loss_fn
 
         self.use_softmin = use_softmin
         self.expectile_l2_loss_tau = expectile_l2_loss_tau
@@ -658,7 +666,13 @@ class MultipleCritics(Module):
         return_breakdown = False,
         **kwargs
     ):
-        critics_values = [critic(states, cont_actions) for critic in self.critics]
+        raw_critics_values = [critic(states, cont_actions) for critic in self.critics]
+
+        if self.has_state_recon:
+            critics_values = [v[0] for v in raw_critics_values]
+            state_recons = stack([v[1] for v in raw_critics_values])
+        else:
+            critics_values = raw_critics_values
 
         critics_values = [stack(one_value_for_critics) for one_value_for_critics in zip(*critics_values)]
 
@@ -699,6 +713,11 @@ class MultipleCritics(Module):
 
         reduced_losses = reduce(losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
 
+        if self.has_state_recon:
+            states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
+            state_recon_loss = self.state_recon_loss_fn(state_recons, states_expanded)
+            reduced_losses = reduced_losses + state_recon_loss * self.state_recon_loss_weight
+
         if not return_breakdown:
             return reduced_losses
 
@@ -711,6 +730,8 @@ class MultipleCriticsWithClassificationLoss(Module):
         *critics: Critic,
         hl_gauss_loss: dict | HLGaussLossFromSupport,
         use_softmin = False,
+        state_recon_loss_weight = 1.0,
+        state_recon_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
         assert len(critics) > 0
@@ -719,7 +740,16 @@ class MultipleCriticsWithClassificationLoss(Module):
         self.num_critics = len(critics)
         self.critics = ModuleList(critics)
 
+        has_state_recons = tuple(critic.state_recon for critic in critics)
+        assert len(set(has_state_recons)) == 1, 'critics must all have state_recon either enabled or disabled'
+        self.has_state_recon = has_state_recons[0]
+
         self.use_softmin = use_softmin
+
+        # maybe state recon loss
+
+        self.state_recon_loss_weight = state_recon_loss_weight
+        self.state_recon_loss_fn = state_recon_loss_fn
 
         if isinstance(hl_gauss_loss, dict):
             hl_gauss_loss = HLGaussLoss(**hl_gauss_loss)
@@ -737,10 +767,16 @@ class MultipleCriticsWithClassificationLoss(Module):
     ):
         raw_critics_values = [critic(states, cont_actions) for critic in self.critics]
 
+        if self.has_state_recon:
+            critics_values_list = [v[0] for v in raw_critics_values]
+            state_recons = stack([v[1] for v in raw_critics_values])
+        else:
+            critics_values_list = raw_critics_values
+
         binned_critics_values = []
         critics_values = []
 
-        for one_value_for_critics in zip(*raw_critics_values):
+        for one_value_for_critics in zip(*critics_values_list):
             stacked_critic_values = stack(one_value_for_critics)
 
             binned_critics_values.append(stacked_critic_values)
@@ -784,6 +820,11 @@ class MultipleCriticsWithClassificationLoss(Module):
 
         reduced_losses = reduce(cross_entropy_losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
 
+        if self.has_state_recon:
+            states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
+            state_recon_loss = self.state_recon_loss_fn(state_recons, states_expanded)
+            reduced_losses = reduced_losses + state_recon_loss * self.state_recon_loss_weight
+
         if not return_breakdown:
             return reduced_losses
 
@@ -795,7 +836,9 @@ class MultipleQuantileCritics(Module):
         self,
         *critics: Critic,
         quantiles: list[float] | Tensor | None = None,
-        frac_atom_keep = 0.75 # will truncate 25% of the top values
+        frac_atom_keep = 0.75, # will truncate 25% of the top values
+        state_recon_loss_weight = 1.0,
+        state_recon_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
         assert len(critics) > 0
@@ -806,6 +849,14 @@ class MultipleQuantileCritics(Module):
 
         self.critics = ModuleList(critics)
         self.num_atom_keep = int(frac_atom_keep * self.num_critics * self.num_quantiles)
+
+        # maybe state recon aux loss
+
+        has_state_recons = tuple(critic.state_recon for critic in critics)
+        assert len(set(has_state_recons)) == 1, 'critics must all have state_recon either enabled or disabled'
+        self.has_state_recon = has_state_recons[0]
+        self.state_recon_loss_weight = state_recon_loss_weight
+        self.state_recon_loss_fn = state_recon_loss_fn
 
         # quantiles
 
@@ -827,9 +878,15 @@ class MultipleQuantileCritics(Module):
         truncate_quantiles_across_critics = False,
         return_breakdown = False
     ):
-        critics_quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
+        raw_critics_quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
 
-        critics_quantile_atoms = [stack(one_value_for_critics) for one_value_for_critics in zip(*critics_quantile_atoms)]
+        if self.has_state_recon:
+            critics_quantile_atoms_list = [v[0] for v in raw_critics_quantile_atoms]
+            state_recons = stack([v[1] for v in raw_critics_quantile_atoms])
+        else:
+            critics_quantile_atoms_list = raw_critics_quantile_atoms
+
+        critics_quantile_atoms = [stack(one_value_for_critics) for one_value_for_critics in zip(*critics_quantile_atoms_list)]
 
         if not exists(target_values):
 
@@ -879,6 +936,11 @@ class MultipleQuantileCritics(Module):
         losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
 
         reduced_losses = reduce(losses, 'c b n q -> b', 'sum').mean()
+
+        if self.has_state_recon:
+            states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
+            state_recon_loss = self.state_recon_loss_fn(state_recons, states_expanded)
+            reduced_losses = reduced_losses + state_recon_loss * self.state_recon_loss_weight
 
         if not return_breakdown:
             return reduced_losses
@@ -975,7 +1037,10 @@ class SAC(Module):
         apply_fire_critic = True,
         fire_num_iters = 20,
         shrink_perturb = False,
-        shrink_perturb_factors = (0.5, 0.01)
+        shrink_perturb_factors = (0.5, 0.01),
+        actor_state_recon_loss_weight = 1.0,
+        critic_state_recon_loss_weight = 1.0,
+        state_recon_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
 
@@ -1028,7 +1093,7 @@ class SAC(Module):
             critic_klass = MultipleQuantileCritics
 
         if is_bearable(critics, list[Critic]):
-            critics = critic_klass(*critics, **critic_kwargs)
+            critics = critic_klass(*critics, **critic_kwargs, state_recon_loss_weight = critic_state_recon_loss_weight, state_recon_loss_fn = state_recon_loss_fn)
 
         assert isinstance(critics, critic_klass), f'expected {critic_klass.__name__} but received critics wrapped with {type(critics).__name__}'
 
@@ -1071,6 +1136,11 @@ class SAC(Module):
 
         self.shrink_perturb = shrink_perturb
         self.shrink_perturb_factors = shrink_perturb_factors
+
+        # state reconstruction auxiliary loss
+
+        self.actor_state_recon_loss_weight = actor_state_recon_loss_weight
+        self.state_recon_loss_fn = state_recon_loss_fn
 
         # steps and frequency of actor update
 
@@ -1233,7 +1303,13 @@ class SAC(Module):
 
                 actor_action_losses.append(one_discrete_actor_loss)
 
-            sum(actor_action_losses).backward()
+            total_actor_loss = sum(actor_action_losses)
+
+            if self.actor.state_recon:
+                actor_state_recon_loss = self.state_recon_loss_fn(actor_output.state_recon, states)
+                total_actor_loss = total_actor_loss + actor_state_recon_loss * self.actor_state_recon_loss_weight
+
+            total_actor_loss.backward()
             self.actor_optimizer.step()
             self.actor_optimizer.zero_grad()
 

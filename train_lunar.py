@@ -61,7 +61,13 @@ def main(
     expectile_l2_loss_tau:  float = 0.45,
     use_beta:               bool = False,
     simplicial_embed:       bool = True,
-    fire_every:             int | None = None
+    fire_every:             int | None = None,
+    actor_state_recon:      bool = False,
+    critic_state_recon:     bool = False,
+    actor_state_recon_loss_weight: float = 0.1,
+    critic_state_recon_loss_weight: float = 0.1,
+    use_huber_recon_loss:   bool = False,
+    state_recon_branch_layer: int = -2
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -99,24 +105,31 @@ def main(
     # networks
 
     actor_critic_kwargs = dict(
-        rsmnorm_input = False,
         dim_state = state_dim,
         num_cont_actions = num_cont_actions,
         num_discrete_actions = num_discrete_actions,
         dim_hidden = dim_hidden,
         mlp_depth = 3,
-        simplicial_embed = simplicial_embed
+        simplicial_embed = simplicial_embed,
+        state_recon_branch_layer = state_recon_branch_layer
     )
 
     actor_kwargs = dict(
         **actor_critic_kwargs,
         use_beta = use_beta,
         target_range = (-1., 1.),
+        state_recon = actor_state_recon
     )
 
     actor = Actor(**actor_kwargs)
 
-    critics = [Critic(**actor_critic_kwargs, dim_out = 1) for _ in range(num_critics)]
+    critic_kwargs = dict(
+        **actor_critic_kwargs,
+        dim_out = 1,
+        state_recon = critic_state_recon
+    )
+
+    critics = [Critic(**critic_kwargs) for _ in range(num_critics)]
 
     agent = SAC(
         actor = actor,
@@ -132,7 +145,10 @@ def main(
         actor_regen_reg_rate = 0.,
         critics_regen_reg_rate = 0.,
         reward_scale = 2.,
-        fire_every = fire_every
+        fire_every = fire_every,
+        actor_state_recon_loss_weight = actor_state_recon_loss_weight,
+        critic_state_recon_loss_weight = critic_state_recon_loss_weight,
+        state_recon_loss_fn = torch.nn.SmoothL1Loss() if use_huber_recon_loss else torch.nn.MSELoss()
     )
 
     agent.to(device)
