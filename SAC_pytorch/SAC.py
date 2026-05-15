@@ -782,6 +782,7 @@ class MultipleCritics(Module):
         discrete_actions: Int['b nd'] | None = None,
         target_values: Float['b n'] | None = None,
         return_breakdown = False,
+        loss_mask: Bool['b s'] | None = None,
         **kwargs
     ):
         raw_critics_values = [critic(states, cont_actions) for critic in self.critics]
@@ -833,6 +834,10 @@ class MultipleCritics(Module):
         target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
 
         losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
+
+        if exists(loss_mask):
+            loss_mask = rearrange(loss_mask, 'b s -> 1 b s 1')
+            losses = losses * loss_mask
 
         reduced_losses = reduce(losses, 'c b s n -> b', 'sum').mean()
 
@@ -886,6 +891,7 @@ class MultipleCriticsWithClassificationLoss(Module):
         discrete_actions: Int['b nd'] | None = None,
         target_values: Float['b n'] | None = None,
         return_breakdown = False,
+        loss_mask: Bool['b s'] | None = None,
         **kwargs
     ):
         raw_critics_values = [critic(states, cont_actions) for critic in self.critics]
@@ -945,6 +951,10 @@ class MultipleCriticsWithClassificationLoss(Module):
 
         cross_entropy_losses = self.hl_gauss_loss(values, target_values, reduction = 'none')
 
+        if exists(loss_mask):
+            loss_mask = rearrange(loss_mask, 'b s -> 1 b s 1')
+            cross_entropy_losses = cross_entropy_losses * loss_mask
+
         reduced_losses = reduce(cross_entropy_losses, 'c b s n -> b', 'sum').mean()
 
         if self.has_state_recon:
@@ -1003,7 +1013,8 @@ class MultipleQuantileCritics(Module):
         discrete_actions: Int['b nd'] | None = None,
         target_values: Float['b n q'] | None = None,
         truncate_quantiles_across_critics = False,
-        return_breakdown = False
+        return_breakdown = False,
+        loss_mask: Bool['b s'] | None = None
     ):
         raw_critics_quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
 
@@ -1067,6 +1078,10 @@ class MultipleQuantileCritics(Module):
 
         error = target_values - quantile_atoms
         losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
+
+        if exists(loss_mask):
+            loss_mask = rearrange(loss_mask, 'b s -> 1 b s 1 1')
+            losses = losses * loss_mask
 
         reduced_losses = reduce(losses, 'c b s n q -> b', 'sum').mean()
 
@@ -1421,11 +1436,16 @@ class SAC(Module):
 
         target_q_values = self.assoc_scan(gates, inputs)[:, :-1]
 
+        # derive loss mask from done - exclude positions after the first terminal in each batch
+
+        loss_mask = F.pad(done[:, :-1], (1, 0)).float().cumsum(dim = 1) == 0.
+
         critics_losses = self.critics(
             states,
             cont_actions = cont_actions,
             discrete_actions = discrete_actions,
-            target_values = target_q_values
+            target_values = target_q_values,
+            loss_mask = loss_mask
         )
 
         # update the critics
