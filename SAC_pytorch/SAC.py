@@ -13,6 +13,7 @@ from torch.nn import Module, ModuleList, Sequential
 
 from x_transformers import Decoder
 from torch_einops_utils import pack_with_inverse
+from assoc_scan import AssocScan
 
 from adam_atan2_pytorch import AdoptAtan2 as Adopt
 
@@ -1284,6 +1285,10 @@ class SAC(Module):
         self.actor_update_freq = actor_update_freq
         self.register_buffer('step', tensor(0))
 
+        # discounted returns
+
+        self.assoc_scan = AssocScan(reverse = True)
+
     @torch.no_grad()
     def apply_fire_(
         self,
@@ -1405,14 +1410,16 @@ class SAC(Module):
         # n-step target q values via reversed cumulative bellman scan
         # when seq_len is 1 this is exactly the standard single-step bellman update
 
-        target_q_values = []
-        bootstrap = next_soft_state_values
+        next_soft_state_values = rearrange(next_soft_state_values, 'b ... -> b 1 ...')
+        rewards = rewards.repeat(1, 1, *next_soft_state_values.shape[2:])
 
-        for t in reversed(range(seq_len)):
-            bootstrap = rewards[:, t] + not_terminal[:, t] * γ * bootstrap
-            target_q_values.append(bootstrap)
+        inputs = cat((rewards, next_soft_state_values), dim = 1)
 
-        target_q_values = stack(target_q_values[::-1], dim = 1)
+        gates = torch.full_like(inputs, γ)
+        gates[:, -1] = 0.
+        gates[:, :-1] = gates[:, :-1] * not_terminal
+
+        target_q_values = self.assoc_scan(gates, inputs)[:, :-1]
 
         critics_losses = self.critics(
             states,

@@ -1,6 +1,6 @@
 [project]
 name = "SAC-pytorch"
-version = "0.2.0"
+version = "0.2.1"
 description = "Soft Actor Critic - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -25,6 +25,7 @@ classifiers=[
 
 dependencies = [
     'adam-atan2-pytorch>=0.1.18',
+    'assoc-scan>=0.0.4',
     'beartype',
     'einops>=0.8.1',
     'einx[torch]>=0.3.0',
