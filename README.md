@@ -240,3 +240,15 @@ agent(
     url     = {https://arxiv.org/abs/2405.19153},
 }
 ```
+
+```bibtex
+@misc{tian2025chunkingcritictransformerbasedsoft,
+    title   = {Chunking the Critic: A Transformer-based Soft Actor-Critic with N-Step Returns},
+    author  = {Dong Tian and Onur Celik and Gerhard Neumann},
+    year    = {2025},
+    eprint  = {2503.03660},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2503.03660},
+}
+```

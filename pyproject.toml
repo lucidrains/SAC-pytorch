@@ -1,6 +1,6 @@
 [project]
 name = "SAC-pytorch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Soft Actor Critic - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -31,7 +31,9 @@ dependencies = [
     'ema-pytorch>=0.6.2',
     'jaxtyping',
     'hl-gauss-pytorch>=0.1.11',
-    'torch>=2.0'
+    'torch>=2.0',
+    'torch-einops-utils>=0.0.34',
+    'x-transformers>=2.19.3'
 ]
 
 [project.urls]

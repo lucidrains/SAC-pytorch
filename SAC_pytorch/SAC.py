@@ -11,6 +11,9 @@ from torch.distributions import Normal, Beta
 from torch import nn, einsum, Tensor, tensor, cat, stack
 from torch.nn import Module, ModuleList, Sequential
 
+from x_transformers import Decoder
+from torch_einops_utils import pack_with_inverse
+
 from adam_atan2_pytorch import AdoptAtan2 as Adopt
 
 from hl_gauss_pytorch import HLGaussLoss, HLGaussLossFromSupport
@@ -627,11 +630,125 @@ class Critic(Module):
             return values, state_recon
         return values
 
+class TransformerCritic(Module):
+    """ Transformer based critic - Dong Tian et al. https://arxiv.org/abs/2503.03660 """
+
+    @beartype
+    def __init__(
+        self,
+        *,
+        dim_state,
+        num_cont_actions,
+        dim_hidden = 256,
+        depth = 3,
+        heads = 8,
+        dim_out = 1,
+        max_seq_len = 10,
+        state_recon = False,
+        state_recon_branch_layer = -1,
+        state_recon_module: Module | None = None
+    ):
+        super().__init__()
+        self.dim_out = dim_out
+        self.max_seq_len = max_seq_len
+        self.num_cont_actions = num_cont_actions
+
+        # projections
+
+        self.state_proj = nn.Linear(dim_state, dim_hidden)
+        self.action_proj = nn.Linear(num_cont_actions, dim_hidden)
+
+        # positional embeddings for action sequence
+
+        self.pos_emb = nn.Embedding(max_seq_len, dim_hidden)
+
+        # transformer decoder
+
+        self.decoder = Decoder(
+            dim = dim_hidden,
+            depth = depth,
+            heads = heads
+        )
+
+        # to values
+
+        self.to_values = Sequential(
+            nn.LayerNorm(dim_hidden),
+            nn.Linear(dim_hidden, num_cont_actions * dim_out)
+        )
+
+        # state reconstruction auxiliary loss
+
+        self.state_recon = state_recon
+        self.state_recon_branch_layer = state_recon_branch_layer
+
+        if state_recon:
+            self.to_state_recon = default(state_recon_module, Sequential(
+                SEM(dim_hidden, pre_layernorm = True),
+                nn.Linear(dim_hidden, dim_hidden),
+                nn.SiLU(),
+                nn.Linear(dim_hidden, dim_state)
+            ))
+
+    def forward(
+        self,
+        state: Float['b ...'],
+        cont_actions: Float['b nc'] | None = None
+    ) -> tuple[Float['b ...'], ...]:
+
+        cont_actions, inverse_seq = pack_with_inverse(cont_actions, 'b * d')
+
+        b, seq, _ = cont_actions.shape
+        assert seq <= self.max_seq_len, f'sequence length {seq} exceeds max_seq_len {self.max_seq_len}'
+
+        # project state and actions into token space
+
+        state_tokens = rearrange(self.state_proj(state), 'b d -> b 1 d')
+        action_tokens = self.action_proj(cont_actions)
+
+        # add positional embeddings to actions
+
+        positions = torch.arange(seq, device = cont_actions.device)
+        action_tokens = action_tokens + self.pos_emb(positions)
+
+        # concat state prefix with action tokens and run through decoder
+
+        tokens = cat((state_tokens, action_tokens), dim = 1)
+
+        if self.state_recon:
+            out, intermediates = self.decoder(tokens, return_hiddens = True)
+            hidden = intermediates.hiddens[self.state_recon_branch_layer]
+            state_recon = self.to_state_recon(hidden[:, 0])
+        else:
+            out = self.decoder(tokens)
+
+        # extract action outputs (skip state prefix token)
+
+        values = self.to_values(out[:, 1:])
+
+        # restore original sequence shape
+
+        values = inverse_seq(values)
+
+        # reshape for multi-dim output (e.g. quantiles or bins)
+
+        if self.dim_out > 1:
+            values = rearrange(values, '... (n o) -> ... n o', o = self.dim_out)
+
+        # wrap in tuple to match Critic return contract (one tensor per action type)
+
+        values = (values,)
+
+        if not self.state_recon:
+            return values
+
+        return values, state_recon
+
 class MultipleCritics(Module):
     @beartype
     def __init__(
         self,
-        *critics: Critic,
+        *critics: Critic | TransformerCritic,
         use_softmin = False,
         expectile_l2_loss_tau = 0.5, # regular mse loss if 0.5
         state_recon_loss_weight = 1.0,
@@ -702,16 +819,21 @@ class MultipleCritics(Module):
 
         cont_critics_values, *discrete_critics_values = critics_values
 
+        cont_critics_values, inverse_seq = pack_with_inverse(cont_critics_values, 'c b * n')
+
         if exists(discrete_actions):
-            discrete_critics_values = [get_at('c b [l], b -> c b', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+            discrete_critics_values = [pack_with_inverse(dcv, 'c b * n')[0] for dcv in discrete_critics_values]
+            discrete_actions, _ = pack_with_inverse(discrete_actions, 'b * nd')
+            discrete_critics_values = [get_at('c b s [l], b s -> c b s', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
-        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b *')
+        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b s *')
 
-        target_values = repeat(target_values, '... -> c ...', c = self.num_critics)
+        target_values, _ = pack_with_inverse(target_values, 'b * d')
+        target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
 
         losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
 
-        reduced_losses = reduce(losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
+        reduced_losses = reduce(losses, 'c b s n -> b', 'sum').mean()
 
         if self.has_state_recon:
             states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
@@ -727,7 +849,7 @@ class MultipleCriticsWithClassificationLoss(Module):
     @beartype
     def __init__(
         self,
-        *critics: Critic,
+        *critics: Critic | TransformerCritic,
         hl_gauss_loss: dict | HLGaussLossFromSupport,
         use_softmin = False,
         state_recon_loss_weight = 1.0,
@@ -806,19 +928,23 @@ class MultipleCriticsWithClassificationLoss(Module):
             return min_critic_values, values
 
         cont_critics_values, *discrete_critics_values = binned_critics_values
+        cont_critics_values, inverse_seq = pack_with_inverse(cont_critics_values, 'c b * n bins')
 
         if exists(discrete_actions):
-            discrete_critics_values = [get_at('c b [l] bins, b -> c b bins', discrete_critics_value, discrete_action) for discrete_critics_value, discrete_action in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+            discrete_critics_values = [pack_with_inverse(dcv, 'c b * n bins')[0] for dcv in discrete_critics_values]
+            discrete_actions, _ = pack_with_inverse(discrete_actions, 'b * nd')
+            discrete_critics_values = [get_at('c b s [l] bins, b s -> c b s bins', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
-        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b * bins')
+        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b s * bins')
 
-        target_values = repeat(target_values, '... -> c ...', c = self.num_critics)
+        target_values, _ = pack_with_inverse(target_values, 'b * d')
+        target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
 
         # from "Stop Regressing" paper out of deepmind, Farebrother et al
 
         cross_entropy_losses = self.hl_gauss_loss(values, target_values, reduction = 'none')
 
-        reduced_losses = reduce(cross_entropy_losses, 'c b n -> b', 'sum').mean() # sum losses per action per critic, and average over batch
+        reduced_losses = reduce(cross_entropy_losses, 'c b s n -> b', 'sum').mean()
 
         if self.has_state_recon:
             states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
@@ -834,7 +960,7 @@ class MultipleQuantileCritics(Module):
     @beartype
     def __init__(
         self,
-        *critics: Critic,
+        *critics: Critic | TransformerCritic,
         quantiles: list[float] | Tensor | None = None,
         frac_atom_keep = 0.75, # will truncate 25% of the top values
         state_recon_loss_weight = 1.0,
@@ -920,11 +1046,17 @@ class MultipleQuantileCritics(Module):
             return return_value, critics_quantile_atoms
 
         cont_quantile_atoms, *discrete_quantile_atoms = critics_quantile_atoms
+        cont_quantile_atoms, inverse_seq = pack_with_inverse(cont_quantile_atoms, 'c b * n q')
 
         if exists(discrete_actions):
-            discrete_quantile_atoms = [get_at('c b [l] q, b -> c b q', discrete_quantile_atom, discrete_action) for discrete_quantile_atom, discrete_action in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
+            discrete_quantile_atoms = [pack_with_inverse(dqa, 'c b * n q')[0] for dqa in discrete_quantile_atoms]
+            discrete_actions, _ = pack_with_inverse(discrete_actions, 'b * nd')
+            discrete_quantile_atoms = [get_at('c b s [l] q, b s -> c b s q', dqa, da) for dqa, da in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
 
-        quantile_atoms, _ = pack([cont_quantile_atoms, *discrete_quantile_atoms], 'c b * q')
+        quantile_atoms, _ = pack([cont_quantile_atoms, *discrete_quantile_atoms], 'c b s * q')
+
+        target_values, _ = pack_with_inverse(target_values, 'b * d q')
+        target_values = repeat(target_values, 'b s d q -> c b s d q', c = self.num_critics)
 
         # quantile regression if training
 
@@ -935,7 +1067,7 @@ class MultipleQuantileCritics(Module):
         error = target_values - quantile_atoms
         losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
 
-        reduced_losses = reduce(losses, 'c b n q -> b', 'sum').mean()
+        reduced_losses = reduce(losses, 'c b s n q -> b', 'sum').mean()
 
         if self.has_state_recon:
             states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
@@ -1014,11 +1146,13 @@ class SAC(Module):
         critics: (
             list[dict] |
             list[Critic] |
+            list[TransformerCritic] |
             MultipleCritics |
             MultipleQuantileCritics |
             MultipleCriticsWithClassificationLoss
         ),
         quantiled_critics = False,
+        transformer_critic = False,
         hl_gauss_loss: dict | HLGaussLossFromSupport | None = None,
         reward_discount_rate = 0.99,
         reward_scale = 1.,
@@ -1043,6 +1177,8 @@ class SAC(Module):
         state_recon_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
+
+        self.transformer_critic = transformer_critic
 
         # set actor
 
@@ -1072,7 +1208,8 @@ class SAC(Module):
         # allow for usual double+ critic trick or truncated quantiled critics
 
         if is_bearable(critics, list[dict]):
-            critics = [Critic(**critic) for critic in critics]
+            critic_klass = TransformerCritic if transformer_critic else Critic
+            critics = [critic_klass(**critic) for critic in critics]
 
         critic_dim_outs = {critic.dim_out for critic in critics}
 
@@ -1092,7 +1229,7 @@ class SAC(Module):
         else:
             critic_klass = MultipleQuantileCritics
 
-        if is_bearable(critics, list[Critic]):
+        if is_bearable(critics, list[Critic]) or is_bearable(critics, list[TransformerCritic]):
             critics = critic_klass(*critics, **critic_kwargs, state_recon_loss_weight = critic_state_recon_loss_weight, state_recon_loss_fn = state_recon_loss_fn)
 
         assert isinstance(critics, critic_klass), f'expected {critic_klass.__name__} but received critics wrapped with {type(critics).__name__}'
@@ -1174,11 +1311,22 @@ class SAC(Module):
         done: Bool['b'],
         next_states: Float['b ...']
     ):
+        # pack sequence dimension - base case is always seq of 1
+
+        rewards, _ = pack_with_inverse(rewards, 'b *')
+        done, _ = pack_with_inverse(done, 'b *')
+
+        seq_len = rewards.shape[1]
+
+        if cont_actions.ndim == 3:
+            assert cont_actions.shape[1] == seq_len, f'rewards chunk length {seq_len} must match actions chunk length {cont_actions.shape[1]}. did you forget to include rewards for each step in the chunk?'
+
+        if done.shape[1] == 1 and seq_len > 1:
+            done = repeat(done, 'b 1 -> b s', s = seq_len)
 
         rewards = rewards * self.reward_scale
 
         # bellman equation
-        # todo: setup n-step
 
         entropy_temp = self.learned_entropy_temperature.alpha.detach()
 
@@ -1243,20 +1391,28 @@ class SAC(Module):
                 discrete_soft_state_value = (next_discrete_prob * (next_discrete_q_value - learned_entropy_weight * next_discrete_log_prob)).sum(dim = 1)
                 next_soft_state_values.append(discrete_soft_state_value)
 
-        # quantile vs not
+        # pack soft state values and expand rewards / done for broadcasting
 
         if self.quantiled_critics:
             next_soft_state_values, _ = pack(next_soft_state_values, 'b * q')
-            rewards = rearrange(rewards, 'b -> b 1 1')
-            not_terminal = rearrange(not_terminal, 'b -> b 1 1')
+            rewards = rearrange(rewards, 'b s -> b s 1 1')
+            not_terminal = rearrange(not_terminal, 'b s -> b s 1 1')
         else:
             next_soft_state_values, _ = pack(next_soft_state_values, 'b *')
-            rewards = rearrange(rewards, 'b -> b 1')
-            not_terminal = rearrange(not_terminal, 'b -> b 1')
+            rewards = rearrange(rewards, 'b s -> b s 1')
+            not_terminal = rearrange(not_terminal, 'b s -> b s 1')
 
-        # target q value
+        # n-step target q values via reversed cumulative bellman scan
+        # when seq_len is 1 this is exactly the standard single-step bellman update
 
-        target_q_values = rewards + not_terminal * γ * next_soft_state_values
+        target_q_values = []
+        bootstrap = next_soft_state_values
+
+        for t in reversed(range(seq_len)):
+            bootstrap = rewards[:, t] + not_terminal[:, t] * γ * bootstrap
+            target_q_values.append(bootstrap)
+
+        target_q_values = stack(target_q_values[::-1], dim = 1)
 
         critics_losses = self.critics(
             states,
