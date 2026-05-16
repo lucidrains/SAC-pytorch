@@ -11,9 +11,11 @@ from torch.distributions import Normal, Beta
 from torch import nn, einsum, Tensor, tensor, cat, stack
 from torch.nn import Module, ModuleList, Sequential
 
-from x_transformers import Decoder
-from torch_einops_utils import pack_with_inverse
 from assoc_scan import AssocScan
+
+from torch_einops_utils import pack_with_inverse, masked_mean, lens_to_mask, mask_after
+
+from x_transformers import Decoder
 
 from adam_atan2_pytorch import AdoptAtan2 as Adopt
 
@@ -835,11 +837,8 @@ class MultipleCritics(Module):
 
         losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
 
-        if exists(loss_mask):
-            loss_mask = rearrange(loss_mask, 'b s -> 1 b s 1')
-            losses = losses * loss_mask
-
-        reduced_losses = reduce(losses, 'c b s n -> b', 'sum').mean()
+        losses = reduce(losses, 'c b s n -> b s', 'sum')
+        reduced_losses = masked_mean(losses, loss_mask)
 
         if self.has_state_recon:
             states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
@@ -951,11 +950,8 @@ class MultipleCriticsWithClassificationLoss(Module):
 
         cross_entropy_losses = self.hl_gauss_loss(values, target_values, reduction = 'none')
 
-        if exists(loss_mask):
-            loss_mask = rearrange(loss_mask, 'b s -> 1 b s 1')
-            cross_entropy_losses = cross_entropy_losses * loss_mask
-
-        reduced_losses = reduce(cross_entropy_losses, 'c b s n -> b', 'sum').mean()
+        cross_entropy_losses = reduce(cross_entropy_losses, 'c b s n -> b s', 'sum')
+        reduced_losses = masked_mean(cross_entropy_losses, loss_mask)
 
         if self.has_state_recon:
             states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
@@ -1079,11 +1075,8 @@ class MultipleQuantileCritics(Module):
         error = target_values - quantile_atoms
         losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
 
-        if exists(loss_mask):
-            loss_mask = rearrange(loss_mask, 'b s -> 1 b s 1 1')
-            losses = losses * loss_mask
-
-        reduced_losses = reduce(losses, 'c b s n q -> b', 'sum').mean()
+        losses = reduce(losses, 'c b s n q -> b s', 'sum')
+        reduced_losses = masked_mean(losses, loss_mask)
 
         if self.has_state_recon:
             states_expanded = repeat(states, 'b ... -> c b ...', c = self.num_critics)
@@ -1190,11 +1183,13 @@ class SAC(Module):
         shrink_perturb_factors = (0.5, 0.01),
         actor_state_recon_loss_weight = 1.0,
         critic_state_recon_loss_weight = 1.0,
-        state_recon_loss_fn: Module = nn.MSELoss()
+        state_recon_loss_fn: Module = nn.MSELoss(),
+        critic_max_grad_norm: float | None = None
     ):
         super().__init__()
 
         self.transformer_critic = transformer_critic
+        self.critic_max_grad_norm = critic_max_grad_norm
 
         # set actor
 
@@ -1329,7 +1324,8 @@ class SAC(Module):
         discrete_actions: Int['b nd'],
         rewards: Float['b'],
         done: Bool['b'],
-        next_states: Float['b ...']
+        next_states: Float['b ...'],
+        n_step_lens: Int['b'] | None = None
     ):
         # pack sequence dimension - base case is always seq of 1
 
@@ -1425,20 +1421,33 @@ class SAC(Module):
         # n-step target q values via reversed cumulative bellman scan
         # when seq_len is 1 this is exactly the standard single-step bellman update
 
+        b = rewards.shape[0]
+        if not exists(n_step_lens):
+            n_step_lens = torch.full((b,), seq_len, device = rewards.device, dtype = torch.long)
+
         next_soft_state_values = rearrange(next_soft_state_values, 'b ... -> b 1 ...')
         rewards = rewards.repeat(1, 1, *next_soft_state_values.shape[2:])
 
-        inputs = cat((rewards, next_soft_state_values), dim = 1)
+        inputs = cat((rewards, torch.zeros_like(rewards[:, :1])), dim = 1)
+        batch_indices = torch.arange(b, device = rewards.device)
+
+        inputs[batch_indices, n_step_lens] = rearrange(next_soft_state_values, 'b 1 ... -> b ...')
 
         gates = torch.full_like(inputs, γ)
-        gates[:, -1] = 0.
+        gates[batch_indices, n_step_lens] = 0.
         gates[:, :-1] = gates[:, :-1] * not_terminal
 
         target_q_values = self.assoc_scan(gates, inputs)[:, :-1]
 
         # derive loss mask from done - exclude positions after the first terminal in each batch
 
-        loss_mask = F.pad(done[:, :-1], (1, 0)).float().cumsum(dim = 1) == 0.
+        loss_mask = mask_after(done, True)
+
+        # also mask out padded positions
+
+        if exists(n_step_lens):
+            pad_mask = lens_to_mask(n_step_lens, seq_len)
+            loss_mask = loss_mask & pad_mask
 
         critics_losses = self.critics(
             states,
@@ -1451,6 +1460,10 @@ class SAC(Module):
         # update the critics
 
         critics_losses.backward()
+
+        if exists(self.critic_max_grad_norm):
+            nn.utils.clip_grad_norm_(self.critics.parameters(), self.critic_max_grad_norm)
+
         self.critics_optimizer.step()
         self.critics_optimizer.zero_grad()
 

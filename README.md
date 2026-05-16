@@ -51,6 +51,12 @@ agent(
 )
 ```
 
+## Train Toy
+
+```bash
+uv run train_lunar.py
+```
+
 ## Citations
 
 ```bibtex

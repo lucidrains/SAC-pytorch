@@ -177,3 +177,81 @@ def test_mismatched_chunk_lengths():
             done = torch.zeros(4).bool(),
             next_states = torch.randn(4, 5)
         )
+
+# e2e with memmap replay buffer and n-step dataloader
+
+def test_transformer_critic_with_replay_buffer(tmp_path):
+    import numpy as np
+    from memmap_replay_buffer import ReplayBuffer
+    from SAC_pytorch import SAC, Actor
+
+    dim_state = 5
+    num_cont_actions = 2
+    n_steps = 8
+
+    # create replay buffer and simulate trajectories
+
+    fields = dict(
+        state = ('float', (dim_state,)),
+        action = ('float', (num_cont_actions,)),
+        reward = ('float', ()),
+        done = ('bool', ()),
+    )
+
+    rb = ReplayBuffer(
+        str(tmp_path / 'replay'),
+        max_episodes = 10,
+        max_timesteps = 50,
+        fields = fields
+    )
+
+    for _ in range(5):
+        ep_len = np.random.randint(15, 30)
+        with rb.one_episode():
+            for t in range(ep_len):
+                rb.store(
+                    state = np.random.randn(dim_state).astype(np.float32),
+                    action = np.random.randn(num_cont_actions).astype(np.float32),
+                    reward = float(np.random.randn()),
+                    done = (t == ep_len - 1),
+                )
+
+    # create agent with transformer critic
+
+    critic_kwargs = dict(
+        dim_state = dim_state,
+        num_cont_actions = num_cont_actions,
+        dim_hidden = 32,
+        dim_out = 1,
+        max_seq_len = n_steps,
+    )
+
+    agent = SAC(
+        actor = Actor(dim_state = dim_state, num_cont_actions = num_cont_actions),
+        critics = [critic_kwargs, critic_kwargs],
+        transformer_critic = True,
+    )
+
+    # load one batch from the n-step dataloader
+
+    dl = rb.dataloader(
+        batch_size = 4,
+        n_steps = n_steps,
+        current_fields = ('state',),
+        next_fields = ('state',),
+        sequence_fields = ('action', 'reward', 'done'),
+        to_named_tuple = ('state', 'next_state', 'seq_action', 'seq_reward', 'seq_done', 'n_step_lens'),
+    )
+
+    batch = next(iter(dl))
+
+    # forward + backward through the agent
+
+    agent(
+        states = batch.state,
+        cont_actions = batch.seq_action,
+        discrete_actions = None,
+        rewards = batch.seq_reward,
+        done = batch.seq_done,
+        next_states = batch.next_state,
+    )

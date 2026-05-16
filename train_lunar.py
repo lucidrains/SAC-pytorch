@@ -1,7 +1,7 @@
 # /// script
 # dependencies = [
-#   "sac-pytorch",
-#   "memmap-replay-buffer",
+#   "sac-pytorch>=0.2.2",
+#   "memmap-replay-buffer>=0.1.1",
 #   "gymnasium[box2d]",
 #   "accelerate",
 #   "fire",
@@ -25,7 +25,7 @@ import numpy as np
 from tqdm import tqdm
 from accelerate import Accelerator
 
-from SAC_pytorch import SAC, Actor, Critic
+from SAC_pytorch import SAC, Actor, Critic, TransformerCritic
 from memmap_replay_buffer import ReplayBuffer
 
 # functions
@@ -42,7 +42,7 @@ def main(
     continuous:             bool = True,
     episodes:               int = 1500,
     batch_size:             int = 256,
-    replay_capacity:        int = 100_000,
+    replay_capacity:        int = 100,
     warmup_steps:           int = 1000,
     epochs:                 int = 2,
     learning_rate:          float = 3e-4,
@@ -67,10 +67,15 @@ def main(
     actor_state_recon_loss_weight: float = 0.1,
     critic_state_recon_loss_weight: float = 0.1,
     use_huber_recon_loss:   bool = False,
-    state_recon_branch_layer: int = -2
+    state_recon_branch_layer: int = -2,
+    use_transformer_critic: bool = False,
+    t_sac_n_step:           int = 16,
+    rollout_cpu:            bool = True,
+    critic_max_grad_norm:   float | None = 0.5
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
+    rollout_device = torch.device('cpu') if rollout_cpu else device
 
     if exists(seed):
         torch.manual_seed(seed)
@@ -123,17 +128,31 @@ def main(
 
     actor = Actor(**actor_kwargs)
 
-    critic_kwargs = dict(
-        **actor_critic_kwargs,
-        dim_out = 1,
-        state_recon = critic_state_recon
-    )
+    critic_klass = TransformerCritic if use_transformer_critic else Critic
 
-    critics = [Critic(**critic_kwargs) for _ in range(num_critics)]
+    if use_transformer_critic:
+        critic_kwargs = dict(
+            dim_state = state_dim,
+            num_cont_actions = num_cont_actions,
+            dim_hidden = dim_hidden,
+            dim_out = 1,
+            max_seq_len = t_sac_n_step,
+            state_recon = critic_state_recon,
+            state_recon_branch_layer = state_recon_branch_layer
+        )
+    else:
+        critic_kwargs = dict(
+            **actor_critic_kwargs,
+            dim_out = 1,
+            state_recon = critic_state_recon
+        )
+
+    critics = [critic_klass(**critic_kwargs) for _ in range(num_critics)]
 
     agent = SAC(
         actor = actor,
         critics = critics,
+        transformer_critic = use_transformer_critic,
         quantiled_critics = False,
         multiple_critics_kwargs = dict(
             expectile_l2_loss_tau = expectile_l2_loss_tau
@@ -148,10 +167,14 @@ def main(
         fire_every = fire_every,
         actor_state_recon_loss_weight = actor_state_recon_loss_weight,
         critic_state_recon_loss_weight = critic_state_recon_loss_weight,
-        state_recon_loss_fn = torch.nn.SmoothL1Loss() if use_huber_recon_loss else torch.nn.MSELoss()
+        state_recon_loss_fn = torch.nn.SmoothL1Loss() if use_huber_recon_loss else torch.nn.MSELoss(),
+        critic_max_grad_norm = critic_max_grad_norm
     )
 
     agent.to(device)
+
+    if rollout_cpu:
+        agent.actor.to(rollout_device)
 
     if continuous:
         agent.learned_entropy_temperature.continuous_entropy_target = num_cont_actions / 2.0
@@ -176,7 +199,8 @@ def main(
         max_episodes = replay_capacity,
         max_timesteps = max_steps_per_episode,
         fields = fields,
-        flush_every_store_step = max_steps_per_episode
+        flush_every_store_step = max_steps_per_episode,
+        circular = True
     )
 
     # training loop
@@ -197,8 +221,10 @@ def main(
 
                 with torch.no_grad():
                     agent.eval()
-                    state_t = torch.tensor(state, dtype = torch.float32, device = device).unsqueeze(0)
+
+                    state_t = torch.tensor(state, dtype = torch.float32, device = rollout_device).unsqueeze(0)
                     actor_output = agent.actor(state_t, sample = True)
+
                     agent.train()
 
                     if continuous:
@@ -236,32 +262,55 @@ def main(
         should_update = total_steps > warmup_steps and divisible_by(episode + 1, update_every_episodes)
 
         if should_update:
-            dl = replay_buffer.dataloader(
-                batch_size = batch_size,
-                timestep_level = True,
-                shuffle = True,
-                device = device,
-                to_named_tuple = ('state', 'action', 'reward', 'done', 'next_state')
-            )
+
+            if rollout_cpu:
+                agent.actor.to(device)
+
+            if use_transformer_critic:
+                dl = replay_buffer.dataloader(
+                    batch_size = batch_size,
+                    n_steps = t_sac_n_step,
+                    current_fields = ('state',),
+                    next_fields = ('state',),
+                    sequence_fields = ('action', 'reward', 'done'),
+                    shuffle = True,
+                    device = device,
+                    to_named_tuple = ('state', 'next_state', 'seq_action', 'seq_reward', 'seq_done', 'n_step_lens')
+                )
+            else:
+                dl = replay_buffer.dataloader(
+                    batch_size = batch_size,
+                    timestep_level = True,
+                    shuffle = True,
+                    device = device,
+                    to_named_tuple = ('state', 'action', 'reward', 'done', 'next_state')
+                )
 
             for _ in range(epochs):
-                for states, actions, rewards, dones, next_states in tqdm(dl, desc = 'Updating', leave = False):
+                for batch in tqdm(dl, desc = 'Updating', leave = False):
 
-                    if continuous:
-                        cont_actions = actions
-                        discrete_actions = None
+                    if use_transformer_critic:
+                        agent(
+                            states = batch.state,
+                            cont_actions = batch.seq_action if continuous else None,
+                            discrete_actions = None if continuous else batch.seq_action,
+                            rewards = batch.seq_reward,
+                            done = batch.seq_done,
+                            next_states = batch.next_state,
+                            n_step_lens = batch.n_step_lens
+                        )
                     else:
-                        cont_actions = None
-                        discrete_actions = actions
+                        agent(
+                            states = batch.state,
+                            cont_actions = batch.action if continuous else None,
+                            discrete_actions = None if continuous else batch.action,
+                            rewards = batch.reward,
+                            done = batch.done,
+                            next_states = batch.next_state
+                        )
 
-                    agent(
-                        states = states,
-                        cont_actions = cont_actions,
-                        discrete_actions = discrete_actions,
-                        rewards = rewards,
-                        done = dones,
-                        next_states = next_states
-                    )
+            if rollout_cpu:
+                agent.actor.to(rollout_device)
 
         # logging
 
