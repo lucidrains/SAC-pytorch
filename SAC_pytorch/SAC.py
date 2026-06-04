@@ -182,9 +182,20 @@ def apply_fire(
 
         t = t / t_norm
 
+        dim_out, dim_in = t.shape
+        is_wide = dim_out < dim_in
+
+        if is_wide:
+            t = t.T
+
         for _ in range(num_iters):
             A = t.T @ t
             t = a * t + b * (t @ A)
+
+        if is_wide:
+            t = t.T
+
+        t = t * (t_norm / t.norm())
 
         if shrink_perturb:
             scale, noise_scale = shrink_perturb_factors
