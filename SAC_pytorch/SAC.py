@@ -814,10 +814,9 @@ class MultipleCritics(Module):
 
             for critic_values in critics_values:
                 if self.use_softmin:
-                    values = stack(values, dim = -1)
-                    softmin = (-values).softmax(dim = -1)
+                    softmin = (-critic_values).softmax(dim = 0)
 
-                    min_critic_value = (softmin * critic_values).sum(dim = -1)
+                    min_critic_value = (softmin * critic_values).sum(dim = 0)
 
                 elif self.one_critic:
                     min_critic_value = critic_values[0]
@@ -830,7 +829,7 @@ class MultipleCritics(Module):
             if not return_breakdown:
                 return min_critic_values
 
-            return min_critic_values, values
+            return min_critic_values, critics_values
 
         cont_critics_values, *discrete_critics_values = critics_values
 
@@ -930,10 +929,9 @@ class MultipleCriticsWithClassificationLoss(Module):
 
             for critic_values in critics_values:
                 if self.use_softmin:
-                    values = stack(values, dim = -1)
-                    softmin = (-values).softmax(dim = -1)
+                    softmin = (-critic_values).softmax(dim = 0)
 
-                    min_critic_value = (softmin * critic_values).sum(dim = -1)
+                    min_critic_value = (softmin * critic_values).sum(dim = 0)
                 else:
                     min_critic_value = torch.minimum(*critic_values)
 
@@ -942,7 +940,7 @@ class MultipleCriticsWithClassificationLoss(Module):
             if not return_breakdown:
                 return min_critic_values
 
-            return min_critic_values, values
+            return min_critic_values, critics_values
 
         cont_critics_values, *discrete_critics_values = binned_critics_values
         cont_critics_values, inverse_seq = pack_with_inverse(cont_critics_values, 'c b * n bins')
@@ -1143,10 +1141,10 @@ class LearnedEntropyTemperature(Module):
                 losses.append(discrete_entropy_temp_loss.mean())
 
         if exists(cont_entropy):
-            cont_entropy_temp_loss = -alpha * (self.continuous_entropy_target - cont_entropy).detach()
+            cont_entropy_summed = cont_entropy.sum(dim = -1)
+            cont_entropy_temp_loss = -alpha * (self.continuous_entropy_target - cont_entropy_summed).detach()
 
-            cont_entropy_temp_loss = cont_entropy_temp_loss.mean(dim = 0)
-            losses.append(cont_entropy_temp_loss)
+            losses.append(cont_entropy_temp_loss.mean())
 
         reduced_losses, _ = pack(losses, '*')
         reduced_losses = reduced_losses.sum()
@@ -1348,6 +1346,8 @@ class SAC(Module):
         if cont_actions.ndim == 3:
             assert cont_actions.shape[1] == seq_len, f'rewards chunk length {seq_len} must match actions chunk length {cont_actions.shape[1]}. did you forget to include rewards for each step in the chunk?'
 
+        assert not (next_states.ndim == 3 and next_states.shape[1] > 1), 'next_states must be the single end-of-chunk state (2D), not a sequence of states. the n-step bootstrap only requires the state at the end of each chunk'
+
         if done.shape[1] == 1 and seq_len > 1:
             done = repeat(done, 'b 1 -> b s', s = seq_len)
 
@@ -1386,9 +1386,9 @@ class SAC(Module):
 
                 self.critics.train(was_training)
 
-        # learned temperature
+        # learned temperature - detached
 
-        learned_entropy_weight = self.learned_entropy_temperature.alpha
+        learned_entropy_weight = self.learned_entropy_temperature.alpha.detach()
 
         next_soft_state_values = []
 

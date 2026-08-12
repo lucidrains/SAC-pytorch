@@ -176,9 +176,6 @@ def main(
     if rollout_cpu:
         agent.actor.to(rollout_device)
 
-    if continuous:
-        agent.learned_entropy_temperature.continuous_entropy_target = num_cont_actions / 2.0
-
     # replay buffer
 
     buffer_path = f'./replay_data_{"cont" if continuous else "disc"}'

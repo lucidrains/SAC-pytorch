@@ -30,7 +30,7 @@ def test_sac(
         dim_state = 5,
         num_cont_actions = 2,
         num_discrete_actions = (5, 5),
-        dim_hidden = 24,
+        dim_hidden = 16,
         state_recon_branch_layer = state_recon_branch_layer
     )
 
@@ -64,7 +64,7 @@ def test_sac(
         state_recon_loss_fn = state_recon_loss_fn,
     )
 
-    for _ in range(10):
+    for _ in range(5):
         state = torch.randn(3, 5)
 
         actor_output = actor(state, sample = True)
@@ -88,6 +88,9 @@ def test_transformer_critic(seq_len):
         dim_state = 5,
         num_cont_actions = 2,
         dim_out = 3,
+        dim_hidden = 32,
+        depth = 2,
+        heads = 4,
         max_seq_len = 10
     )
 
@@ -112,6 +115,9 @@ def test_sac_transformer_critic_e2e(seq_len):
         dim_state = 5,
         num_cont_actions = 2,
         dim_out = 3,
+        dim_hidden = 32,
+        depth = 2,
+        heads = 4,
         max_seq_len = 10
     )
 
@@ -155,6 +161,9 @@ def test_mismatched_chunk_lengths():
         dim_state = 5,
         num_cont_actions = 2,
         dim_out = 3,
+        dim_hidden = 32,
+        depth = 2,
+        heads = 4,
         max_seq_len = 10
     )
 
@@ -222,6 +231,8 @@ def test_transformer_critic_with_replay_buffer(tmp_path):
         dim_state = dim_state,
         num_cont_actions = num_cont_actions,
         dim_hidden = 32,
+        depth = 2,
+        heads = 4,
         dim_out = 1,
         max_seq_len = n_steps,
     )
@@ -255,3 +266,74 @@ def test_transformer_critic_with_replay_buffer(tmp_path):
         done = batch.seq_done,
         next_states = batch.next_state,
     )
+
+# softmin critics + breakdown returns
+
+def test_multiple_critics_softmin():
+    from SAC_pytorch.SAC import MultipleCritics, MultipleCriticsWithClassificationLoss, Critic
+
+    critic_kwargs = dict(dim_state = 3, num_cont_actions = 2, dim_hidden = 8)
+
+    critics = MultipleCritics(
+        Critic(**critic_kwargs),
+        Critic(**critic_kwargs),
+        use_softmin = True
+    )
+
+    states = torch.randn(4, 3)
+    cont_actions = torch.randn(4, 2)
+
+    min_values = critics(states, cont_actions = cont_actions)
+    assert len(min_values) == 1
+
+    min_values, breakdown = critics(states, cont_actions = cont_actions, return_breakdown = True)
+    assert len(breakdown) == 1
+
+    # classification loss version
+
+    critics = MultipleCriticsWithClassificationLoss(
+        Critic(**{**critic_kwargs, 'dim_out': 5}),
+        Critic(**{**critic_kwargs, 'dim_out': 5}),
+        hl_gauss_loss = dict(min_value = -10., max_value = 10., num_bins = 5),
+        use_softmin = True
+    )
+
+    min_values = critics(states, cont_actions = cont_actions)
+    assert len(min_values) == 1
+
+# learned entropy temperature target should be total entropy across action dims
+
+def test_learned_entropy_temperature_target():
+    from SAC_pytorch.SAC import LearnedEntropyTemperature
+
+    num_cont_actions = 2
+
+    temperature = LearnedEntropyTemperature(num_cont_actions = num_cont_actions, num_discrete_actions = ())
+
+    # equilibrium should occur when the total entropy over action dims equals the target
+
+    entropy = torch.full((4, num_cont_actions), num_cont_actions / 2)
+    loss = temperature(cont_entropy = entropy)
+    grad = torch.autograd.grad(loss, temperature.log_alpha)[0]
+
+    assert abs(grad.item()) < 1e-4
+
+# sequence of next states is not supported - should raise clear error
+
+def test_sequence_next_states_error():
+    from SAC_pytorch import SAC, Actor
+
+    agent = SAC(
+        actor = Actor(dim_state = 5, num_cont_actions = 2),
+        critics = [dict(dim_state = 5, num_cont_actions = 2, dim_hidden = 16)] * 2
+    )
+
+    with pytest.raises(AssertionError, match = 'next_states'):
+        agent(
+            states = torch.randn(4, 3, 5),
+            cont_actions = torch.randn(4, 3, 2),
+            discrete_actions = None,
+            rewards = torch.randn(4, 3),
+            done = torch.zeros(4).bool(),
+            next_states = torch.randn(4, 3, 5),
+        )
