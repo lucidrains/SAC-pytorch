@@ -152,6 +152,53 @@ def test_sac_transformer_critic_e2e(seq_len):
         next_states = next_state
     )
 
+# discrete-only actions (no continuous actions) - e.g. LunarLander discrete
+
+@param('quantiled_critics', (False, True))
+@param('use_minto', (False, True))
+def test_sac_discrete_only(quantiled_critics, use_minto):
+    from SAC_pytorch import SAC, Actor, Critic
+
+    critic_kwargs = dict(
+        dim_state = 5,
+        num_cont_actions = 0,
+        num_discrete_actions = (4,),
+        dim_hidden = 16
+    )
+
+    actor = Actor(**critic_kwargs)
+
+    critic_dim_out = 3 if quantiled_critics else 1
+
+    critics = [Critic(**critic_kwargs, dim_out = critic_dim_out), Critic(**critic_kwargs, dim_out = critic_dim_out)]
+
+    agent = SAC(
+        actor = actor,
+        critics = critics,
+        quantiled_critics = quantiled_critics,
+        use_minto = use_minto,
+        fire_every = 5,
+    )
+
+    state = torch.randn(3, 5)
+
+    for _ in range(5):
+        actor_output = actor(state, sample = True)
+
+        assert actor_output.continuous is None
+        assert actor_output.continuous_log_prob is None
+        assert actor_output.continuous_entropy is None
+        assert actor_output.discrete.shape == (3, 1)
+
+        agent(
+            states = state,
+            cont_actions = None,
+            discrete_actions = actor_output.discrete,
+            rewards = torch.randn(3),
+            done = torch.zeros(3).bool(),
+            next_states = torch.randn(3, 5)
+        )
+
 # assertion for mismatched chunk lengths
 
 def test_mismatched_chunk_lengths():

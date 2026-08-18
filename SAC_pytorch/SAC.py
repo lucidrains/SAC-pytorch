@@ -47,7 +47,7 @@ Bool  = TorchTyping(jaxtyping.Bool)
 # q - quantiles
 
 from einx import get_at
-from einops import rearrange, repeat, reduce, pack, unpack
+from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 # EMA for target networks
@@ -84,6 +84,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def is_empty(t):
+    return t.numel() == 0
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -92,6 +95,9 @@ def compact(arr):
 
 def identity(t):
     return t
+
+def pack(t, pattern):
+    return pack_with_inverse(t, pattern)[0]
 
 def cast_tuple(t, length = 1):
     return t if isinstance(t, tuple) else ((t,) * length)
@@ -449,6 +455,8 @@ class Actor(Module):
         cont_action_dims = num_cont_actions * 2
 
         self.num_cont_actions = num_cont_actions
+        self.has_cont_actions = num_cont_actions > 0
+
         self.num_discrete_actions = num_discrete_actions
         self.split_dims = (discrete_action_dims, cont_action_dims)
 
@@ -507,20 +515,23 @@ class Actor(Module):
         discrete_action_logits = discrete_actions.split(self.num_discrete_actions, dim = -1)
 
         if not sample:
-            cont_output = self.cont_dist.process_params(cont_actions)
+            cont_output = self.cont_dist.process_params(cont_actions) if self.has_cont_actions else None
             return SoftActorOutput(cont_output, discrete_action_logits, state_recon)
 
         # handle continuous
 
-        sampled_cont_actions, cont_log_prob, cont_entropy, source_range = self.cont_dist(cont_actions, reparametrize = cont_reparametrize)
+        sampled_cont_actions = cont_log_prob = cont_entropy = source_range = None
 
-        if exists(self.target_range) and self.target_range != source_range:
-            sampled_cont_actions = rescale_from_to(sampled_cont_actions, source_range, self.target_range)
+        if self.has_cont_actions:
+            sampled_cont_actions, cont_log_prob, cont_entropy, source_range = self.cont_dist(cont_actions, reparametrize = cont_reparametrize)
 
-            scale = get_scale(source_range, self.target_range)
+            if exists(self.target_range) and self.target_range != source_range:
+                sampled_cont_actions = rescale_from_to(sampled_cont_actions, source_range, self.target_range)
 
-            cont_log_prob = cont_log_prob - math.log(scale)
-            cont_entropy = cont_entropy + math.log(scale)
+                scale = get_scale(source_range, self.target_range)
+
+                cont_log_prob = cont_log_prob - math.log(scale)
+                cont_entropy = cont_entropy + math.log(scale)
 
         # handle discrete
 
@@ -622,7 +633,7 @@ class Critic(Module):
 
         pack_input = compact([state, cont_actions])
 
-        mlp_input, _ = pack(pack_input, 'b *')
+        mlp_input = pack(pack_input, 'b *')
 
         if self.state_recon:
             values, embeds = self.to_values(mlp_input, return_all_layers = True)
@@ -833,16 +844,16 @@ class MultipleCritics(Module):
 
         cont_critics_values, *discrete_critics_values = critics_values
 
-        cont_critics_values, inverse_seq = pack_with_inverse(cont_critics_values, 'c b * n')
+        cont_critics_values = pack(cont_critics_values, 'c b * n') if not is_empty(cont_critics_values) else None
 
         if exists(discrete_actions):
-            discrete_critics_values = [pack_with_inverse(dcv, 'c b * n')[0] for dcv in discrete_critics_values]
-            discrete_actions, _ = pack_with_inverse(discrete_actions, 'b * nd')
+            discrete_critics_values = [pack(dcv, 'c b * n') for dcv in discrete_critics_values]
+            discrete_actions, = pack(discrete_actions, 'b * nd')
             discrete_critics_values = [get_at('c b s [l], b s -> c b s', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
-        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b s *')
+        values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s *')
 
-        target_values, _ = pack_with_inverse(target_values, 'b * d')
+        target_values, = pack(target_values, 'b * d')
         target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
 
         losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
@@ -943,16 +954,17 @@ class MultipleCriticsWithClassificationLoss(Module):
             return min_critic_values, critics_values
 
         cont_critics_values, *discrete_critics_values = binned_critics_values
-        cont_critics_values, inverse_seq = pack_with_inverse(cont_critics_values, 'c b * n bins')
+
+        cont_critics_values = pack(cont_critics_values, 'c b * n bins') if not is_empty(cont_critics_values) else None
 
         if exists(discrete_actions):
-            discrete_critics_values = [pack_with_inverse(dcv, 'c b * n bins')[0] for dcv in discrete_critics_values]
-            discrete_actions, _ = pack_with_inverse(discrete_actions, 'b * nd')
+            discrete_critics_values = [pack(dcv, 'c b * n bins') for dcv in discrete_critics_values]
+            discrete_actions, = pack(discrete_actions, 'b * nd')
             discrete_critics_values = [get_at('c b s [l] bins, b s -> c b s bins', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
-        values, _ = pack([cont_critics_values, *discrete_critics_values], 'c b s * bins')
+        values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s * bins')
 
-        target_values, _ = pack_with_inverse(target_values, 'b * d')
+        target_values, = pack(target_values, 'b * d')
         target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
 
         # from "Stop Regressing" paper out of deepmind, Farebrother et al
@@ -1063,16 +1075,17 @@ class MultipleQuantileCritics(Module):
             return return_value, critics_quantile_atoms
 
         cont_quantile_atoms, *discrete_quantile_atoms = critics_quantile_atoms
-        cont_quantile_atoms, inverse_seq = pack_with_inverse(cont_quantile_atoms, 'c b * n q')
+
+        cont_quantile_atoms = pack(cont_quantile_atoms, 'c b * n q') if not is_empty(cont_quantile_atoms) else None
 
         if exists(discrete_actions):
-            discrete_quantile_atoms = [pack_with_inverse(dqa, 'c b * n q')[0] for dqa in discrete_quantile_atoms]
-            discrete_actions, _ = pack_with_inverse(discrete_actions, 'b * nd')
+            discrete_quantile_atoms = [pack(dqa, 'c b * n q') for dqa in discrete_quantile_atoms]
+            discrete_actions, = pack(discrete_actions, 'b * nd')
             discrete_quantile_atoms = [get_at('c b s [l] q, b s -> c b s q', dqa, da) for dqa, da in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
 
-        quantile_atoms, _ = pack([cont_quantile_atoms, *discrete_quantile_atoms], 'c b s * q')
+        quantile_atoms = pack(compact([cont_quantile_atoms, *discrete_quantile_atoms]), 'c b s * q')
 
-        target_values, _ = pack_with_inverse(target_values, 'b * d q')
+        target_values, = pack(target_values, 'b * d q')
         target_values = repeat(target_values, 'b s d q -> c b s d q', c = self.num_critics)
 
         # quantile regression if training
@@ -1146,7 +1159,7 @@ class LearnedEntropyTemperature(Module):
 
             losses.append(cont_entropy_temp_loss.mean())
 
-        reduced_losses, _ = pack(losses, '*')
+        reduced_losses = pack(losses, '*')
         reduced_losses = reduced_losses.sum()
 
         if not return_breakdown:
@@ -1338,12 +1351,12 @@ class SAC(Module):
     ):
         # pack sequence dimension - base case is always seq of 1
 
-        rewards, _ = pack_with_inverse(rewards, 'b *')
-        done, _ = pack_with_inverse(done, 'b *')
+        rewards, = pack(rewards, 'b *')
+        done, = pack(done, 'b *')
 
         seq_len = rewards.shape[1]
 
-        if cont_actions.ndim == 3:
+        if exists(cont_actions) and cont_actions.ndim == 3:
             assert cont_actions.shape[1] == seq_len, f'rewards chunk length {seq_len} must match actions chunk length {cont_actions.shape[1]}. did you forget to include rewards for each step in the chunk?'
 
         assert not (next_states.ndim == 3 and next_states.shape[1] > 1), 'next_states must be the single end-of-chunk state (2D), not a sequence of states. the n-step bootstrap only requires the state at the end of each chunk'
@@ -1421,11 +1434,11 @@ class SAC(Module):
         # pack soft state values and expand rewards / done for broadcasting
 
         if self.quantiled_critics:
-            next_soft_state_values, _ = pack(next_soft_state_values, 'b * q')
+            next_soft_state_values = pack(next_soft_state_values, 'b * q')
             rewards = rearrange(rewards, 'b s -> b s 1 1')
             not_terminal = rearrange(not_terminal, 'b s -> b s 1 1')
         else:
-            next_soft_state_values, _ = pack(next_soft_state_values, 'b *')
+            next_soft_state_values = pack(next_soft_state_values, 'b *')
             rewards = rearrange(rewards, 'b s -> b s 1')
             not_terminal = rearrange(not_terminal, 'b s -> b s 1')
 
