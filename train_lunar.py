@@ -71,11 +71,29 @@ def main(
     use_transformer_critic: bool = False,
     t_sac_n_step:           int = 16,
     rollout_cpu:            bool = True,
-    critic_max_grad_norm:   float | None = 0.5
+    critic_max_grad_norm:   float | None = 0.5,
+    use_qwm:                bool = False,
+    qwm_num_candidates:     int = 8,
+    qwm_num_world_samples:  int = 1,
+    qwm_search_depth:       int = 4,
+    qwm_num_beam:           int = 1,
+    qwm_num_leaf_actions:   int = 8,
+    qwm_tree_discount:      float = 0.1,
+    qwm_sample:             bool = True,
+    actor_spr:              bool = False,
+    critic_spr:             bool = False,
+    actor_spr_loss_weight:  float = 1.0,
+    critic_spr_loss_weight: float = 1.0
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
     rollout_device = torch.device('cpu') if rollout_cpu else device
+
+    # QWM tree search requires both the actor and critics to be on the same device
+
+    if use_qwm:
+        rollout_cpu = False
+        rollout_device = device
 
     if exists(seed):
         torch.manual_seed(seed)
@@ -104,8 +122,17 @@ def main(
         num_cont_actions = env.action_space.shape[0]
         num_discrete_actions = ()
     else:
+        assert not use_qwm, 'QWM world model tree search requires continuous actions'
+
         num_cont_actions = 0
         num_discrete_actions = (int(env.action_space.n),)
+
+    # QWM world model tree search takes the SPR formulation - the SPR branch
+    # (transition model + reconstruction head) is enabled within both the actor and critic
+
+    if use_qwm:
+        actor_spr = True
+        critic_spr = True
 
     # networks
 
@@ -123,7 +150,8 @@ def main(
         **actor_critic_kwargs,
         use_beta = use_beta,
         target_range = (-1., 1.),
-        state_recon = actor_state_recon
+        state_recon = actor_state_recon,
+        spr = actor_spr
     )
 
     actor = Actor(**actor_kwargs)
@@ -144,10 +172,20 @@ def main(
         critic_kwargs = dict(
             **actor_critic_kwargs,
             dim_out = 1,
-            state_recon = critic_state_recon
+            state_recon = critic_state_recon,
+            spr = critic_spr
         )
 
     critics = [critic_klass(**critic_kwargs) for _ in range(num_critics)]
+
+    world_model_kwargs = dict(
+        num_candidates = qwm_num_candidates,
+        num_world_samples = qwm_num_world_samples,
+        search_depth = qwm_search_depth,
+        num_beam = qwm_num_beam,
+        num_leaf_actions = qwm_num_leaf_actions,
+        tree_discount = qwm_tree_discount
+    ) if use_qwm else None
 
     agent = SAC(
         actor = actor,
@@ -168,7 +206,10 @@ def main(
         actor_state_recon_loss_weight = actor_state_recon_loss_weight,
         critic_state_recon_loss_weight = critic_state_recon_loss_weight,
         state_recon_loss_fn = torch.nn.SmoothL1Loss() if use_huber_recon_loss else torch.nn.MSELoss(),
-        critic_max_grad_norm = critic_max_grad_norm
+        critic_max_grad_norm = critic_max_grad_norm,
+        world_model = world_model_kwargs,
+        actor_spr_loss_weight = actor_spr_loss_weight,
+        critic_spr_loss_weight = critic_spr_loss_weight
     )
 
     agent.to(device)
@@ -220,18 +261,25 @@ def main(
                     agent.eval()
 
                     state_t = torch.tensor(state, dtype = torch.float32, device = rollout_device).unsqueeze(0)
-                    actor_output = agent.actor(state_t, sample = True)
 
-                    agent.train()
-
-                    if continuous:
-                        action_raw = actor_output.continuous[0].cpu().numpy()
+                    if use_qwm:
+                        action_raw = agent.select_action(state_t, sample = qwm_sample).cpu().numpy()[0]
                         action_env = np.clip(action_raw, -1., 1.)
                         action_store = action_env
+                        agent.train()
                     else:
-                        action_raw = actor_output.discrete[0].cpu().numpy()
-                        action_env = int(action_raw[0])
-                        action_store = action_raw
+                        actor_output = agent.actor(state_t, sample = True)
+
+                        agent.train()
+
+                        if continuous:
+                            action_raw = actor_output.continuous[0].cpu().numpy()
+                            action_env = np.clip(action_raw, -1., 1.)
+                            action_store = action_env
+                        else:
+                            action_raw = actor_output.discrete[0].cpu().numpy()
+                            action_env = int(action_raw[0])
+                            action_store = action_raw
 
                 next_state, reward, terminated, truncated, _ = env.step(action_env)
 

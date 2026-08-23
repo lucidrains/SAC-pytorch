@@ -6,3 +6,7 @@ from SAC_pytorch.SAC import (
     MultipleCritics,
     MultipleQuantileCritics,
 )
+
+from SAC_pytorch.world_model import (
+    WorldModel,
+)

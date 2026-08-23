@@ -258,3 +258,27 @@ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2503.03660},
 }
 ```
+
+```bibtex
+@misc{schwarzer2021dataefficientreinforcementlearningselfpredictive,
+    title   = {Data-Efficient Reinforcement Learning with Self-Predictive Representations},
+    author  = {Max Schwarzer and Ankesh Anand and Rishab Goel and R Devon Hjelm and Aaron Courville and Philip Bachman},
+    year    = {2021},
+    eprint  = {2007.05929},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2007.05929},
+}
+```
+
+```bibtex
+@misc{dong2026qlearningworldmodels,
+    title   = {Q-Learning With World Models},
+    author  = {Perry Dong and Yueru Jia and Chelsea Finn and Dorsa Sadigh},
+    year    = {2026},
+    eprint  = {2608.17163},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2608.17163},
+}
+```

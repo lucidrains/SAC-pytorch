@@ -21,6 +21,8 @@ from adam_atan2_pytorch import AdoptAtan2 as Adopt
 
 from hl_gauss_pytorch import HLGaussLoss, HLGaussLossFromSupport
 
+from SAC_pytorch.world_model import WorldModel
+
 # tensor typing
 
 import jaxtyping
@@ -47,6 +49,7 @@ Bool  = TorchTyping(jaxtyping.Bool)
 # q - quantiles
 
 from einx import get_at
+from einops import pack as einops_pack
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
@@ -64,7 +67,8 @@ ContinuousOutput = namedtuple('ContinuousOutput', [
 SoftActorOutput = namedtuple('SoftActorOutput', [
     'continuous',
     'discrete',
-    'state_recon'
+    'state_recon',
+    'spr_embed'
 ], defaults=(None,))
 
 SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', [
@@ -73,7 +77,8 @@ SampledSoftActorOutput = namedtuple('SampledSoftActorOutput', [
     'continuous_entropy',
     'discrete',
     'discrete_action_logits',
-    'state_recon'
+    'state_recon',
+    'spr_embed'
 ], defaults=(None,))
 
 # helpers
@@ -228,6 +233,15 @@ def maybe_distributed_mean(t):
 
 def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
+
+class ConcatThen(Module):
+    """concatenates multiple inputs along the last dimension before the inner modules - used by the spr transition model"""
+    def __init__(self, *modules):
+        super().__init__()
+        self.module = nn.Sequential(*modules)
+
+    def forward(self, *tensors):
+        return self.module(einops_pack(tensors, 'b *')[0])
 
 # Simplicial Embeddings
 # Lavoie et al - https://arxiv.org/abs/2204.00616
@@ -446,7 +460,9 @@ class Actor(Module):
         target_range: tuple[float, float] | None = None,
         state_recon = False,
         state_recon_branch_layer = -1,
-        state_recon_module: Module | None = None
+        state_recon_module: Module | None = None,
+        spr = False,
+        spr_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
         self.eps = eps
@@ -491,6 +507,48 @@ class Actor(Module):
                 nn.Linear(recon_dim_hidden, dim_state)
             ))
 
+        # SPR world model branch
+        # self-predictive representations (SPR) - Schwarzer et al. https://arxiv.org/abs/2007.05929
+        # the SPR branch (latent transition model + reconstruction head) acts as the world
+        # model for the test-time tree search planning of the WorldModel module
+        # the reconstruction head predicts the next state as a residual delta - Mψ(s, a) = s + Δψ(s, a)
+
+        self.spr = spr
+
+        if spr:
+            assert num_cont_actions > 0, 'spr world model branch requires continuous actions'
+
+            self.spr_loss_fn = spr_loss_fn
+
+            spr_dim_hidden = default(dim_hidden, dim_state * 2)
+
+            self.to_next_latent = ConcatThen(
+                nn.Linear(spr_dim_hidden + num_cont_actions, spr_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(spr_dim_hidden, spr_dim_hidden)
+            )
+
+            self.spr_proj = Sequential(
+                nn.Linear(spr_dim_hidden, spr_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(spr_dim_hidden, spr_dim_hidden)
+            )
+
+            self.to_next_state_recon = Sequential(
+                SEM(spr_dim_hidden, pre_layernorm = True),
+                nn.Linear(spr_dim_hidden, spr_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(spr_dim_hidden, dim_state)
+            )
+
+            # reward model - rψ(s, a), used by the world model tree search (eq. 6, 9)
+
+            self.to_reward = ConcatThen(
+                nn.Linear(spr_dim_hidden + num_cont_actions, spr_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(spr_dim_hidden, 1)
+            )
+
     def forward(
         self,
         state: Float['b ...'],
@@ -503,20 +561,22 @@ class Actor(Module):
         SampledSoftActorOutput
     ):
 
-        if self.state_recon:
+        if self.state_recon or self.spr:
             action_dims, embeds = self.to_actions(state, return_all_layers = True)
             embed = embeds[self.state_recon_branch_layer]
-            state_recon = self.to_state_recon(embed)
+            state_recon = self.to_state_recon(embed) if self.state_recon else None
+            spr_embed = embed if self.spr else None
         else:
             action_dims = self.to_actions(state)
             state_recon = None
+            spr_embed = None
 
         discrete_actions, cont_actions = action_dims.split(self.split_dims, dim = -1)
         discrete_action_logits = discrete_actions.split(self.num_discrete_actions, dim = -1)
 
         if not sample:
             cont_output = self.cont_dist.process_params(cont_actions) if self.has_cont_actions else None
-            return SoftActorOutput(cont_output, discrete_action_logits, state_recon)
+            return SoftActorOutput(cont_output, discrete_action_logits, state_recon, spr_embed)
 
         # handle continuous
 
@@ -559,8 +619,63 @@ class Actor(Module):
             cont_entropy,
             stack(sampled_discrete_actions, dim = -1) if len(sampled_discrete_actions) > 0 else None,
             discrete_action_logits,
-            state_recon
+            state_recon,
+            spr_embed
         )
+
+    def spr_embedding(self, state: Float['b ...']):
+        """the branch embedding acting as the SPR encoder output"""
+        _, embeds = self.to_actions(state, return_all_layers = True)
+        return embeds[self.state_recon_branch_layer]
+
+    def spr_next_state(self, state: Float['b ...'], action: Float['b nc'], embed: Float['b h'] | None = None):
+        """world model next-state prediction via the SPR branch - Mψ(s, a) = s + Δψ(s, a)"""
+        embed = default(embed, self.spr_embedding(state))
+        next_latent = self.to_next_latent(embed, action)
+        delta = self.to_next_state_recon(next_latent)
+        return state + delta
+
+    def spr_reward(self, state: Float['b ...'], action: Float['b nc'], embed: Float['b h'] | None = None):
+        """reward model prediction rψ(s, a) via the SPR branch"""
+        embed = default(embed, self.spr_embedding(state))
+        return self.to_reward(embed, action)
+
+    def spr_loss(
+        self,
+        state: Float['b ...'],
+        action: Float['b nc'],
+        next_state: Float['b ...'],
+        reward: Float['b'] | None = None,
+        return_breakdown = False
+    ):
+        """
+        SPR self-predictive loss (Schwarzer et al.) with a reconstruction head
+        predicting the next state and a reward model - latent transition conditioned
+        on the action, latent target is the detached branch embedding of the next state
+        """
+        embed = self.spr_embedding(state)
+        next_latent = self.to_next_latent(embed, action)
+
+        predicted_delta = self.to_next_state_recon(next_latent)
+        recon_loss = self.spr_loss_fn(predicted_delta, next_state - state)
+
+        with torch.no_grad():
+            target_latent = self.spr_embedding(next_state)
+
+        latent_loss = self.spr_loss_fn(self.spr_proj(next_latent), target_latent)
+
+        total_loss = recon_loss + latent_loss
+
+        reward_loss = None
+        if exists(reward):
+            predicted_reward = self.to_reward(embed, action)
+            reward_loss = self.spr_loss_fn(rearrange(predicted_reward, 'b 1 -> b'), reward)
+            total_loss = total_loss + reward_loss
+
+        if not return_breakdown:
+            return total_loss
+
+        return total_loss, (recon_loss, latent_loss, reward_loss)
 
 class Critic(Module):
     @beartype
@@ -577,7 +692,9 @@ class Critic(Module):
         simplicial_embed = False,
         state_recon = False,
         state_recon_branch_layer = -1,
-        state_recon_module: Module | None = None
+        state_recon_module: Module | None = None,
+        spr = False,
+        spr_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
 
@@ -613,6 +730,40 @@ class Critic(Module):
                 nn.SiLU(),
                 nn.Linear(recon_dim_hidden, dim_state)
             ))
+
+        # SPR world model branch
+        # self-predictive representations (SPR) - Schwarzer et al. https://arxiv.org/abs/2007.05929
+        # the SPR branch (latent transition model + reconstruction head) acts as the world
+        # model for the test-time tree search planning of the WorldModel module
+        # the reconstruction head predicts the next state as a residual delta - Mψ(s, a) = s + Δψ(s, a)
+
+        self.spr = spr
+
+        if spr:
+            assert num_cont_actions > 0, 'spr world model branch requires continuous actions'
+
+            self.spr_loss_fn = spr_loss_fn
+
+            spr_dim_hidden = default(dim_hidden, (dim_state + num_cont_actions) * 2)
+
+            self.to_next_latent = ConcatThen(
+                nn.Linear(spr_dim_hidden + num_cont_actions, spr_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(spr_dim_hidden, spr_dim_hidden)
+            )
+
+            self.spr_proj = Sequential(
+                nn.Linear(spr_dim_hidden, spr_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(spr_dim_hidden, spr_dim_hidden)
+            )
+
+            self.to_next_state_recon = Sequential(
+                SEM(spr_dim_hidden, pre_layernorm = True),
+                nn.Linear(spr_dim_hidden, spr_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(spr_dim_hidden, dim_state)
+            )
 
         # save the number of quantiles and the number of actions, for splitting out the output of the critic correctly
 
@@ -655,6 +806,51 @@ class Critic(Module):
             return values, state_recon
         return values
 
+    def spr_embedding(self, state: Float['b ...'], cont_actions: Float['b {self._n}'] | None = None):
+        """the branch embedding acting as the SPR encoder output"""
+        pack_input = compact([state, cont_actions])
+        mlp_input = pack(pack_input, 'b *')
+        _, embeds = self.to_values(mlp_input, return_all_layers = True)
+        return embeds[self.state_recon_branch_layer]
+
+    def spr_next_state(self, state: Float['b ...'], cont_actions: Float['b {self._n}'] | None = None):
+        """world model next-state prediction via the SPR branch - Mψ(s, a) = s + Δψ(s, a)"""
+        embed = self.spr_embedding(state, cont_actions)
+        next_latent = self.to_next_latent(embed, cont_actions)
+        delta = self.to_next_state_recon(next_latent)
+        return state + delta
+
+    def spr_loss(
+        self,
+        state: Float['b ...'],
+        cont_actions: Float['b {self._n}'],
+        next_state: Float['b ...'],
+        next_cont_actions: Float['b {self._n}'],
+        return_breakdown = False
+    ):
+        """
+        SPR self-predictive loss (Schwarzer et al.) with a reconstruction head
+        predicting the next state - latent transition conditioned on the action,
+        latent target is the detached branch embedding of the next state
+        """
+        embed = self.spr_embedding(state, cont_actions)
+        next_latent = self.to_next_latent(embed, cont_actions)
+
+        predicted_delta = self.to_next_state_recon(next_latent)
+        recon_loss = self.spr_loss_fn(predicted_delta, next_state - state)
+
+        with torch.no_grad():
+            target_latent = self.spr_embedding(next_state, next_cont_actions)
+
+        latent_loss = self.spr_loss_fn(self.spr_proj(next_latent), target_latent)
+
+        total_loss = recon_loss + latent_loss
+
+        if not return_breakdown:
+            return total_loss
+
+        return total_loss, (recon_loss, latent_loss)
+
 class TransformerCritic(Module):
     """ Transformer based critic - Dong Tian et al. https://arxiv.org/abs/2503.03660 """
 
@@ -677,6 +873,10 @@ class TransformerCritic(Module):
         self.dim_out = dim_out
         self.max_seq_len = max_seq_len
         self.num_cont_actions = num_cont_actions
+
+        # transformer critics do not support the spr world model branch
+
+        self.spr = False
 
         # projections
 
@@ -848,12 +1048,12 @@ class MultipleCritics(Module):
 
         if exists(discrete_actions):
             discrete_critics_values = [pack(dcv, 'c b * n') for dcv in discrete_critics_values]
-            discrete_actions, = pack(discrete_actions, 'b * nd')
+            discrete_actions = pack(discrete_actions, 'b * nd')
             discrete_critics_values = [get_at('c b s [l], b s -> c b s', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
         values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s *')
 
-        target_values, = pack(target_values, 'b * d')
+        target_values = pack(target_values, 'b * d')
         target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
 
         losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
@@ -959,12 +1159,12 @@ class MultipleCriticsWithClassificationLoss(Module):
 
         if exists(discrete_actions):
             discrete_critics_values = [pack(dcv, 'c b * n bins') for dcv in discrete_critics_values]
-            discrete_actions, = pack(discrete_actions, 'b * nd')
+            discrete_actions = pack(discrete_actions, 'b * nd')
             discrete_critics_values = [get_at('c b s [l] bins, b s -> c b s bins', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
         values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s * bins')
 
-        target_values, = pack(target_values, 'b * d')
+        target_values = pack(target_values, 'b * d')
         target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
 
         # from "Stop Regressing" paper out of deepmind, Farebrother et al
@@ -1080,12 +1280,12 @@ class MultipleQuantileCritics(Module):
 
         if exists(discrete_actions):
             discrete_quantile_atoms = [pack(dqa, 'c b * n q') for dqa in discrete_quantile_atoms]
-            discrete_actions, = pack(discrete_actions, 'b * nd')
+            discrete_actions = pack(discrete_actions, 'b * nd')
             discrete_quantile_atoms = [get_at('c b s [l] q, b s -> c b s q', dqa, da) for dqa, da in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
 
         quantile_atoms = pack(compact([cont_quantile_atoms, *discrete_quantile_atoms]), 'c b s * q')
 
-        target_values, = pack(target_values, 'b * d q')
+        target_values = pack(target_values, 'b * d q')
         target_values = repeat(target_values, 'b s d q -> c b s d q', c = self.num_critics)
 
         # quantile regression if training
@@ -1206,7 +1406,10 @@ class SAC(Module):
         actor_state_recon_loss_weight = 1.0,
         critic_state_recon_loss_weight = 1.0,
         state_recon_loss_fn: Module = nn.MSELoss(),
-        critic_max_grad_norm: float | None = None
+        critic_max_grad_norm: float | None = None,
+        world_model: WorldModel | dict | None = None,
+        actor_spr_loss_weight = 1.0,
+        critic_spr_loss_weight = 1.0
     ):
         super().__init__()
 
@@ -1270,6 +1473,24 @@ class SAC(Module):
         self.critics = critics
 
         self.quantiled_critics = quantiled_critics
+
+        # world model for test-time tree search (QWM - Dong et al. https://arxiv.org/abs/2608.17163)
+        # the world model takes the SPR formulation - the transition + reconstruction head lives
+        # within the actor and critic, while all tree search planning logic is kept in this module
+
+        if isinstance(world_model, dict):
+            world_model = WorldModel(actor = actor, critics = critics, **world_model)
+
+        self.world_model = world_model
+
+        # spr world model losses
+
+        self.actor_spr_loss_weight = actor_spr_loss_weight
+        self.critic_spr_loss_weight = critic_spr_loss_weight
+
+        critics_spr_flags = {critic.spr for critic in self.critics.critics}
+        assert len(critics_spr_flags) == 1, 'critics must all have spr either enabled or disabled'
+        self.critics_have_spr = next(iter(critics_spr_flags))
 
         # critic optimizers
 
@@ -1351,8 +1572,8 @@ class SAC(Module):
     ):
         # pack sequence dimension - base case is always seq of 1
 
-        rewards, = pack(rewards, 'b *')
-        done, = pack(done, 'b *')
+        rewards = pack(rewards, 'b *')
+        done = pack(done, 'b *')
 
         seq_len = rewards.shape[1]
 
@@ -1481,6 +1702,13 @@ class SAC(Module):
             loss_mask = loss_mask
         )
 
+        # spr world model losses - self-predictive next-state prediction on real transitions
+        # (the world model is trained on real data, only used for search at decision time)
+
+        if self.critics_have_spr and exists(cont_actions) and states.ndim == 2:
+            critic_spr_loss = stack([critic.spr_loss(states, cont_actions, next_states, next_cont_actions) for critic in self.critics.critics]).sum()
+            critics_losses = critics_losses + critic_spr_loss * self.critic_spr_loss_weight
+
         # update the critics
 
         critics_losses.backward()
@@ -1529,6 +1757,10 @@ class SAC(Module):
                 actor_state_recon_loss = self.state_recon_loss_fn(actor_output.state_recon, states)
                 total_actor_loss = total_actor_loss + actor_state_recon_loss * self.actor_state_recon_loss_weight
 
+            if self.actor.spr and states.ndim == 2:
+                actor_spr_loss = self.actor.spr_loss(states, actor_output.continuous, next_states, reward = reduce(rewards, 'b 1 n -> b', 'sum'))
+                total_actor_loss = total_actor_loss + actor_spr_loss * self.actor_spr_loss_weight
+
             total_actor_loss.backward()
             self.actor_optimizer.step()
             self.actor_optimizer.zero_grad()
@@ -1556,3 +1788,18 @@ class SAC(Module):
 
         if exists(self.fire_every) and step > 0 and divisible_by(step, self.fire_every):
             self.apply_fire_(num_iters = self.fire_num_iters)
+
+    @torch.no_grad()
+    def select_action(
+        self,
+        state: Float['b ...'],
+        sample = True
+    ):
+        """
+        select an action at the given state - uses the world model tree search
+        (QWM - Dong et al.) if present, otherwise direct policy sampling
+        """
+        if exists(self.world_model):
+            return self.world_model.select_action(state, sample = sample)
+
+        return self.actor(state, sample = True)
