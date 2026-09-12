@@ -1,6 +1,6 @@
 # /// script
 # dependencies = [
-#   "sac-pytorch>=0.2.2",
+#   "sac-pytorch>=0.3.0",
 #   "memmap-replay-buffer>=0.1.1",
 #   "gymnasium[box2d]",
 #   "accelerate",
@@ -59,7 +59,7 @@ def main(
     num_critics:            int = 2,
     dim_hidden:             int = 384,
     expectile_l2_loss_tau:  float = 0.45,
-    use_beta:               bool = False,
+    use_beta:               bool = True,
     simplicial_embed:       bool = True,
     fire_every:             int | None = None,
     actor_state_recon:      bool = False,
@@ -83,7 +83,8 @@ def main(
     actor_spr:              bool = False,
     critic_spr:             bool = False,
     actor_spr_loss_weight:  float = 1.0,
-    critic_spr_loss_weight: float = 1.0
+    critic_spr_loss_weight: float = 1.0,
+    target_continuous_entropy: float | None = None
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -209,7 +210,8 @@ def main(
         critic_max_grad_norm = critic_max_grad_norm,
         world_model = world_model_kwargs,
         actor_spr_loss_weight = actor_spr_loss_weight,
-        critic_spr_loss_weight = critic_spr_loss_weight
+        critic_spr_loss_weight = critic_spr_loss_weight,
+        target_continuous_entropy = target_continuous_entropy
     )
 
     agent.to(device)
@@ -366,7 +368,8 @@ def main(
 
             pbar.set_postfix(
                 reward = f'{avg_reward:.1f}',
-                steps = f'{avg_steps:.1f}'
+                steps = f'{avg_steps:.1f}',
+                alpha = f'{agent.learned_entropy_temperature.alpha.item():.3f}'
             )
 
             if len(recent_rewards) == rolling_window and avg_reward > target_reward:

@@ -7,7 +7,10 @@ from collections import namedtuple
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.distributions import Normal, Beta
+
+from torch.distributions import Normal
+from mean_conc_beta import Beta
+
 from torch import nn, einsum, Tensor, tensor, cat, stack
 from torch.nn import Module, ModuleList, Sequential
 
@@ -112,9 +115,6 @@ def cast_tuple(t, length = 1):
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
-def l2norm(t):
-    return F.normalize(t, p = 2, dim = -1)
-
 def entropy(t, eps = 1e-20):
     prob = t.softmax(dim = -1)
     return (-prob * log(prob, eps = eps)).sum(dim = -1)
@@ -152,21 +152,6 @@ def expectile_l2_loss(
         loss = loss.mean()
 
     return loss
-
-# orthogonal residual updates
-# https://arxiv.org/abs/2505.11881
-
-def orthog_project(x, y):
-    dtype = x.dtype
-
-    if x.device.type != 'mps':
-        x, y = x.double(), y.double()
-
-    unit = l2norm(y)
-    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
-    orthog = x - parallel
-
-    return orthog.to(dtype)
 
 # FIRE - Frobenius-Isometry Reinitialization
 # Han et al. https://arxiv.org/abs/2602.08040
@@ -273,6 +258,27 @@ class SEM(Module):
         t = (t / self.temperature).softmax(dim = -1)
         return rearrange(t, '... l v -> ... (l v)')
 
+# attention residuals - Kimi Team https://arxiv.org/abs/2603.15031
+# using the enformer attention pool style
+
+class AttentionResidual(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.to_attn_logits = nn.Conv1d(dim, dim, 1, bias = False)
+
+        nn.init.dirac_(self.to_attn_logits.weight)
+
+        with torch.no_grad():
+            self.to_attn_logits.weight.mul_(2)
+
+    def forward(self, history):
+        values = rearrange(stack(history), 'l b d -> b d l')
+
+        logits = self.to_attn_logits(values)
+        attn = logits.softmax(dim = -1)
+
+        return einsum('b d l, b d l -> b d', attn, values)
+
 # SimBa - Kaist + SonyAI research
 
 class ReluSquared(Module):
@@ -324,6 +330,8 @@ class SimBa(Module):
 
         self.layers = ModuleList(layers)
 
+        self.attn_res_layers = ModuleList([AttentionResidual(dim_hidden) for _ in range(depth)])
+
         self.final_norm = nn.LayerNorm(dim_hidden) if final_norm else nn.Identity()
 
         self.simplicial_embed = SEM(dim_hidden, pre_layernorm = not final_norm) if simplicial_embed else nn.Identity()
@@ -338,11 +346,13 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
+        history = [x]
         layers = []
 
-        for layer in self.layers:
-            layer_out = layer(x)
-            x = x + orthog_project(layer_out, x)
+        for attn_res, layer in zip(self.attn_res_layers, self.layers):
+            x = layer(x)
+            history.append(x)
+            x = attn_res(history)
 
             if return_all_layers:
                 layers.append(x)
@@ -407,36 +417,36 @@ class SquashedNormal(Module):
         return squashed, log_prob, entropy, self.source_range
 
 class BetaDistribution(Module):
-    def __init__(self, eps = 1e-5):
+    def __init__(
+        self,
+        eps = 1e-5,
+        init_conc = 2.,
+        detach_entropy_mean = False,
+        **kwargs
+    ):
         super().__init__()
-        self.eps = eps
-        self.source_range = (0., 1.)
+        self.beta = Beta(eps = eps, init_conc = init_conc, detach_entropy_mean = detach_entropy_mean, **kwargs)
+        self.source_range = self.beta.val_range
 
     def process_params(self, params):
-        alpha, beta = rearrange(params, '... (n alpha_beta) -> alpha_beta ... n', alpha_beta = 2)
-
-        # unimodal
-
-        alpha = F.softplus(alpha) + 1. + self.eps
-        beta = F.softplus(beta) + 1. + self.eps
-        return ContinuousOutput(alpha, beta)
+        params = rearrange(params, '... (n mean_conc) -> ... n mean_conc', mean_conc = 2)
+        mean = self.beta.mean(params)
+        conc = self.beta.concentration(params)
+        return ContinuousOutput(mean, conc)
 
     def forward(self, params, reparametrize = False):
-        alpha, beta = self.process_params(params)
+        params = rearrange(params, '... (n mean_conc) -> ... n mean_conc', mean_conc = 2)
 
-        dist = Beta(alpha, beta)
+        dist = self.beta(params)
 
-        if not reparametrize:
-            sampled = dist.sample()
-        else:
-            sampled = dist.rsample()
+        sampled = dist.rsample() if reparametrize else dist.sample()
 
         # log prob
 
-        sampled_for_log_prob = sampled.clamp(min = self.eps, max = 1. - self.eps)
-        log_prob = dist.log_prob(sampled_for_log_prob)
+        log_prob = dist.log_prob(sampled)
 
-        # entropy
+        # entropy - unlike PPO, SAC relies on the entropy bonus to keep the
+        # policy mean off the action bounds, so the mean is not detached here
 
         entropy = dist.entropy()
 
@@ -456,6 +466,7 @@ class Actor(Module):
         dim_hidden = None,
         eps = 1e-5,
         use_beta = False,
+        beta_kwargs: dict = dict(),
         simplicial_embed = False,
         target_range: tuple[float, float] | None = None,
         state_recon = False,
@@ -486,7 +497,7 @@ class Actor(Module):
 
         # continuous distribution
 
-        cont_klass = BetaDistribution if use_beta else SquashedNormal
+        cont_klass = partial(BetaDistribution, **beta_kwargs) if use_beta else SquashedNormal
         self.cont_dist = cont_klass(eps = eps)
 
         self.target_range = target_range
@@ -1317,7 +1328,8 @@ class LearnedEntropyTemperature(Module):
     def __init__(
         self,
         num_discrete_actions = 0,
-        num_cont_actions = 0
+        num_cont_actions = 0,
+        continuous_entropy_target: float | None = None
     ):
         super().__init__()
 
@@ -1327,7 +1339,7 @@ class LearnedEntropyTemperature(Module):
         self.has_continuous = num_cont_actions > 0
 
         self.discrete_entropy_targets = [0.98 * math.log(one_num_discrete_actions) for one_num_discrete_actions in num_discrete_actions]
-        self.continuous_entropy_target = num_cont_actions
+        self.continuous_entropy_target = default(continuous_entropy_target, float(num_cont_actions))
 
     @property
     def alpha(self):
@@ -1409,7 +1421,8 @@ class SAC(Module):
         critic_max_grad_norm: float | None = None,
         world_model: WorldModel | dict | None = None,
         actor_spr_loss_weight = 1.0,
-        critic_spr_loss_weight = 1.0
+        critic_spr_loss_weight = 1.0,
+        target_continuous_entropy: float | None = None
     ):
         super().__init__()
 
@@ -1429,10 +1442,17 @@ class SAC(Module):
             regen_reg_rate = actor_regen_reg_rate
         )
         # based on the actor hyperparameters, init the learned temperature container
+        # the beta distribution on (-1, 1) has entropy bounded above by
+        # n * log(2), so half the usual gaussian entropy target is used
+
+        if not exists(target_continuous_entropy):
+            entropy_target_scale = 0.5 if isinstance(actor.cont_dist, BetaDistribution) else 1.
+            target_continuous_entropy = actor.num_cont_actions * entropy_target_scale
 
         self.learned_entropy_temperature = LearnedEntropyTemperature(
             num_cont_actions = actor.num_cont_actions,
-            num_discrete_actions = actor.num_discrete_actions
+            num_discrete_actions = actor.num_discrete_actions,
+            continuous_entropy_target = target_continuous_entropy
         )
 
         self.temperature_optimizer = Adopt(

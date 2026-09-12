@@ -384,3 +384,64 @@ def test_sequence_next_states_error():
             done = torch.zeros(4).bool(),
             next_states = torch.randn(4, 3, 5),
         )
+
+# test mean_conc_beta integration and scale multiplication
+
+@param('target_range', (None, (-1., 1.), (-2.5, 2.5)))
+def test_mean_conc_beta_integration(target_range):
+    from SAC_pytorch import Actor
+    from SAC_pytorch.SAC import BetaDistribution
+    from mean_conc_beta import Beta
+
+    actor = Actor(
+        dim_state = 6,
+        num_cont_actions = 3,
+        use_beta = True,
+        target_range = target_range
+    )
+
+    assert isinstance(actor.cont_dist, BetaDistribution)
+    assert isinstance(actor.cont_dist.beta, Beta)
+    assert actor.cont_dist.source_range == (-1., 1.)
+
+    state = torch.randn(16, 6)
+    out = actor(state, sample = True)
+
+    scale = 2.5 if target_range == (-2.5, 2.5) else 1.0
+
+    assert out.continuous.shape == (16, 3)
+    assert (out.continuous >= -scale).all() and (out.continuous <= scale).all()
+    assert not torch.isnan(out.continuous).any()
+    assert not torch.isnan(out.continuous_log_prob).any()
+    assert not torch.isnan(out.continuous_entropy).any()
+
+    # deterministic mode action
+    det_out = actor(state, sample = False)
+    assert det_out.continuous.mu.shape == (16, 3)
+    assert (det_out.continuous.mu >= -1.0).all() and (det_out.continuous.mu <= 1.0).all()
+
+def test_mean_conc_beta_entropy_depends_on_mean():
+    from SAC_pytorch import Actor
+
+    actor = Actor(dim_state = 6, num_cont_actions = 3, use_beta = True)
+
+    params = torch.randn(4, 6, requires_grad = True)
+    _, _, entropy, _ = actor.cont_dist(params, reparametrize = True)
+
+    entropy.sum().backward()
+
+    # the policy mean must receive exploration pressure, otherwise it
+    # saturates at the action bounds and the entropy collapses
+
+    assert params.grad[..., 0].abs().sum() > 0.
+
+def test_mean_conc_beta_entropy_target():
+    from SAC_pytorch import Actor, SAC, Critic
+
+    actor = Actor(dim_state = 6, num_cont_actions = 3, use_beta = True)
+    critics = [Critic(dim_state = 6, num_cont_actions = 3, dim_hidden = 16, dim_out = 1) for _ in range(2)]
+
+    agent = SAC(actor = actor, critics = critics)
+
+    assert agent.learned_entropy_temperature.continuous_entropy_target == 1.5
+
