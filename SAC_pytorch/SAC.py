@@ -426,7 +426,7 @@ class BetaDistribution(Module):
     ):
         super().__init__()
         self.beta = Beta(eps = eps, init_conc = init_conc, detach_entropy_mean = detach_entropy_mean, **kwargs)
-        self.source_range = self.beta.val_range
+        self.source_range = tuple(map(float, self.beta.bounds))
 
     def process_params(self, params):
         params = rearrange(params, '... (n mean_conc) -> ... n mean_conc', mean_conc = 2)
