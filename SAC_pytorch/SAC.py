@@ -1597,6 +1597,9 @@ class SAC(Module):
 
         seq_len = rewards.shape[1]
 
+        if exists(cont_actions):
+            cont_actions = cont_actions.detach()
+
         if exists(cont_actions) and cont_actions.ndim == 3:
             assert cont_actions.shape[1] == seq_len, f'rewards chunk length {seq_len} must match actions chunk length {cont_actions.shape[1]}. did you forget to include rewards for each step in the chunk?'
 
@@ -1748,6 +1751,8 @@ class SAC(Module):
             cont_entropy = actor_output.continuous_entropy
             discrete_logits = actor_output.discrete_action_logits
 
+            self.critics.requires_grad_(False)
+
             cont_q_values, *discrete_q_values = self.critics(
                 states,
                 cont_actions = actor_output.continuous,
@@ -1777,11 +1782,13 @@ class SAC(Module):
                 actor_state_recon_loss = self.state_recon_loss_fn(actor_output.state_recon, states)
                 total_actor_loss = total_actor_loss + actor_state_recon_loss * self.actor_state_recon_loss_weight
 
-            if self.actor.spr and states.ndim == 2:
-                actor_spr_loss = self.actor.spr_loss(states, actor_output.continuous, next_states, reward = reduce(rewards, 'b 1 n -> b', 'sum'))
+            if self.actor.spr and exists(cont_actions) and states.ndim == 2:
+                actor_spr_loss = self.actor.spr_loss(states, cont_actions, next_states, reward = reduce(rewards, 'b ... -> b', 'mean'))
                 total_actor_loss = total_actor_loss + actor_spr_loss * self.actor_spr_loss_weight
 
             total_actor_loss.backward()
+            self.critics.requires_grad_(True)
+
             self.actor_optimizer.step()
             self.actor_optimizer.zero_grad()
 
