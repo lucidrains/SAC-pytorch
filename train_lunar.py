@@ -17,6 +17,7 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 import shutil
 from collections import deque
+from itertools import islice
 
 import torch
 import gymnasium as gym
@@ -41,26 +42,26 @@ def divisible_by(num, den):
 def main(
     continuous:             bool = True,
     episodes:               int = 1500,
-    batch_size:             int = 256,
-    replay_capacity:        int = 100,
+    batch_size:             int = 128,
+    replay_capacity:        int = 500,
     warmup_steps:           int = 1000,
-    epochs:                 int = 2,
-    learning_rate:          float = 3e-4,
+    epochs:                 int = 1,
+    learning_rate:          float = 1e-3,
     gamma:                  float = 0.99,
     seed:                   int | None = None,
     log_every:              int = 2,
     clear_buffer:           bool = True,
     record_video_every:     int = 100,
-    cpu:                    bool = False,
+    cpu:                    bool = True,
     max_steps_per_episode:  int = 500,
-    update_every_episodes:  int = 25,
-    target_reward:          float = 25.,
+    update_every_episodes:  int = 1,
+    target_reward:          float = 200.,
     rolling_window:         int = 20,
     num_critics:            int = 2,
-    dim_hidden:             int = 384,
+    dim_hidden:             int = 64,
     expectile_l2_loss_tau:  float = 0.45,
     use_beta:               bool = True,
-    simplicial_embed:       bool = True,
+    simplicial_embed:       bool = False,
     fire_every:             int | None = None,
     actor_state_recon:      bool = False,
     critic_state_recon:     bool = False,
@@ -199,7 +200,7 @@ def main(
         reward_discount_rate = gamma,
         actor_learning_rate = learning_rate,
         critics_learning_rate = learning_rate,
-        temperature_learning_rate = learning_rate,
+        temperature_learning_rate = learning_rate * 3.,
         actor_regen_reg_rate = 0.,
         critics_regen_reg_rate = 0.,
         reward_scale = 2.,
@@ -334,7 +335,7 @@ def main(
                 )
 
             for _ in range(epochs):
-                for batch in tqdm(dl, desc = 'Updating', leave = False):
+                for batch in islice(dl, episode_length // 2):
 
                     if use_transformer_critic:
                         agent(

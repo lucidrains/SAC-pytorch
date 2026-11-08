@@ -443,5 +443,5 @@ def test_mean_conc_beta_entropy_target():
 
     agent = SAC(actor = actor, critics = critics)
 
-    assert agent.learned_entropy_temperature.continuous_entropy_target == 1.5
+    assert agent.learned_entropy_temperature.continuous_entropy_target == 3 * actor.cont_dist.beta.target_entropy.item()
 

@@ -264,20 +264,13 @@ class SEM(Module):
 class AttentionResidual(Module):
     def __init__(self, dim):
         super().__init__()
-        self.to_attn_logits = nn.Conv1d(dim, dim, 1, bias = False)
-
-        nn.init.dirac_(self.to_attn_logits.weight)
-
-        with torch.no_grad():
-            self.to_attn_logits.weight.mul_(2)
+        self.to_attn_logits = nn.Linear(dim, dim, bias = False)
+        nn.init.zeros_(self.to_attn_logits.weight)
 
     def forward(self, history):
-        values = rearrange(stack(history), 'l b d -> b d l')
-
-        logits = self.to_attn_logits(values)
-        attn = logits.softmax(dim = -1)
-
-        return einsum('b d l, b d l -> b d', attn, values)
+        values = stack(history, dim = -2)
+        attn = self.to_attn_logits(values).softmax(dim = -2)
+        return (attn * values).sum(dim = -2)
 
 # SimBa - Kaist + SonyAI research
 
@@ -296,7 +289,7 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
-        final_norm = False,
+        final_norm = True,
         simplicial_embed = True
     ):
         super().__init__()
@@ -322,7 +315,7 @@ class SimBa(Module):
                 nn.Linear(dim_inner, dim_hidden),
             )
 
-            nn.init.constant_(layer[-1].weight, 1e-5)
+            nn.init.orthogonal_(layer[-1].weight, gain = 0.1)
 
             layers.append(layer)
 
@@ -420,12 +413,11 @@ class BetaDistribution(Module):
     def __init__(
         self,
         eps = 1e-5,
-        init_conc = 2.,
         detach_entropy_mean = False,
         **kwargs
     ):
         super().__init__()
-        self.beta = Beta(eps = eps, init_conc = init_conc, detach_entropy_mean = detach_entropy_mean, **kwargs)
+        self.beta = Beta(eps = eps, detach_entropy_mean = detach_entropy_mean, **kwargs)
         self.source_range = tuple(map(float, self.beta.bounds))
 
     def process_params(self, params):
@@ -1442,11 +1434,9 @@ class SAC(Module):
             regen_reg_rate = actor_regen_reg_rate
         )
         # based on the actor hyperparameters, init the learned temperature container
-        # the beta distribution on (-1, 1) has entropy bounded above by
-        # n * log(2), so half the usual gaussian entropy target is used
 
         if not exists(target_continuous_entropy):
-            entropy_target_scale = 0.5 if isinstance(actor.cont_dist, BetaDistribution) else 1.
+            entropy_target_scale = actor.cont_dist.beta.target_entropy.mean().item() if isinstance(actor.cont_dist, BetaDistribution) else 1.
             target_continuous_entropy = actor.num_cont_actions * entropy_target_scale
 
         self.learned_entropy_temperature = LearnedEntropyTemperature(
@@ -1526,7 +1516,7 @@ class SAC(Module):
             critics,
             beta = critic_target_ema_decay,
             include_online_model = False,
-            **ema_kwargs
+            **(dict(update_every = 1, update_after_step = 0, min_value = critic_target_ema_decay) | ema_kwargs)
         )
 
         # minto - taking the minimum of both online and ema
