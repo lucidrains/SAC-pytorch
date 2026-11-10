@@ -70,9 +70,12 @@ class WorldModel(nn.Module):
         """rψ(s, a) - reward model via actor's SPR branch"""
         return self.actor.spr_reward(state, cont_actions, embed = embed)
 
-    def critic_value(self, state, cont_actions):
-        """min over the critic ensemble of Q(s, a) - summed over the per-action-dimension values"""
-        min_values, = self.critics(state, cont_actions = cont_actions)
+    def critic_value(self, state, cont_actions, reward_lane_weights = None):
+        """min over the critic ensemble of Q(s, a) - summed over the per-action-dimension (and reward lane) values"""
+        if reward_lane_weights is None and getattr(self.critics, 'num_reward_lanes', 1) > 1:
+            reward_lane_weights = torch.ones(self.critics.num_reward_lanes, device = state.device)
+
+        min_values, = self.critics(state, cont_actions = cont_actions, reward_lane_weights = reward_lane_weights)
         return reduce(min_values, '... n -> ...', 'sum')
 
     def value_at(self, states, depth):

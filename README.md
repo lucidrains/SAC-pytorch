@@ -282,3 +282,23 @@ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2608.17163},
 }
 ```
+
+```bibtex
+@inproceedings{vanSeijen2017HybridRA,
+    title   = {Hybrid Reward Architecture for Reinforcement Learning},
+    author  = {Harm van Seijen and Mehdi Fatemi and Joshua Romoff and Romain Laroche and Tavian Barnes and Jeffrey Tsang},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year    = {2017},
+    url     = {https://arxiv.org/abs/1706.04208}
+}
+```
+
+```bibtex
+@inproceedings{Russell2003QDecompositionFR,
+    title   = {Q-Decomposition for Reinforcement Learning Agents},
+    author  = {Stuart J. Russell and Andrew L. Zimdars},
+    booktitle = {International Conference on Machine Learning},
+    year    = {2003},
+    url     = {https://dl.acm.org/doi/10.5555/3041838.3041920}
+}
+```

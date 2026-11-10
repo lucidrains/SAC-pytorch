@@ -692,6 +692,7 @@ class Critic(Module):
         dim_hidden = None,
         dropout = 0.,
         dim_out = 1,
+        num_reward_lanes = 1,
         simplicial_embed = False,
         state_recon = False,
         state_recon_branch_layer = -1,
@@ -700,15 +701,16 @@ class Critic(Module):
         spr_loss_fn: Module = nn.MSELoss()
     ):
         super().__init__()
+        assert num_reward_lanes >= 1
 
         dim_out = default(dim_out, dim_state)
 
         num_actions_split = tensor((num_cont_actions, *num_discrete_actions))
 
         # determine the output dimension of the critic
-        # which is the sum of all the actions (continous and discrete), multiplied by the number of quantiles
+        # which is the sum of all the actions (continuous and discrete), multiplied by the number of reward lanes and quantiles
 
-        critic_dim_out = num_actions_split * dim_out
+        critic_dim_out = num_actions_split * num_reward_lanes * dim_out
 
         self.to_values = SimBa(
             dim_state + num_cont_actions,
@@ -768,10 +770,12 @@ class Critic(Module):
                 nn.Linear(spr_dim_hidden, dim_state)
             )
 
-        # save the number of quantiles and the number of actions, for splitting out the output of the critic correctly
+        # save the number of reward lanes, quantiles, and actions, for splitting out the output of the critic correctly
 
+        self.num_cont_actions = num_cont_actions
         self.num_actions_split = num_actions_split.tolist()
 
+        self.num_reward_lanes = num_reward_lanes
         self.dim_out = dim_out
 
         # for tensor typing
@@ -796,12 +800,20 @@ class Critic(Module):
         else:
             values = self.to_values(mlp_input)
 
+        has_lanes = self.num_reward_lanes > 1
         greater_one_output_dim = self.dim_out > 1
 
-        if greater_one_output_dim:
+        if has_lanes and greater_one_output_dim:
+            values = rearrange(values, '... (n r o) -> ... n r o', r = self.num_reward_lanes, o = self.dim_out)
+            split_dim = -3
+        elif has_lanes:
+            values = rearrange(values, '... (n r) -> ... n r', r = self.num_reward_lanes)
+            split_dim = -2
+        elif greater_one_output_dim:
             values = rearrange(values, '... (n o) -> ... n o', o = self.dim_out)
-
-        split_dim = -2 if greater_one_output_dim else -1
+            split_dim = -2
+        else:
+            split_dim = -1
 
         values = values.split(self.num_actions_split, dim = split_dim)
 
@@ -867,13 +879,17 @@ class TransformerCritic(Module):
         depth = 3,
         heads = 8,
         dim_out = 1,
+        num_reward_lanes = 1,
         max_seq_len = 10,
         state_recon = False,
         state_recon_branch_layer = -1,
         state_recon_module: Module | None = None
     ):
         super().__init__()
+        assert num_reward_lanes >= 1
+
         self.dim_out = dim_out
+        self.num_reward_lanes = num_reward_lanes
         self.max_seq_len = max_seq_len
         self.num_cont_actions = num_cont_actions
 
@@ -902,7 +918,7 @@ class TransformerCritic(Module):
 
         self.to_values = Sequential(
             nn.LayerNorm(dim_hidden),
-            nn.Linear(dim_hidden, num_cont_actions * dim_out)
+            nn.Linear(dim_hidden, num_cont_actions * num_reward_lanes * dim_out)
         )
 
         # state reconstruction auxiliary loss
@@ -921,7 +937,7 @@ class TransformerCritic(Module):
     def forward(
         self,
         state: Float['b ...'],
-        cont_actions: Float['b nc'] | None = None
+        cont_actions: Float['b ... nc'] | None = None
     ) -> tuple[Float['b ...'], ...]:
 
         cont_actions, inverse_seq = pack_with_inverse(cont_actions, 'b * d')
@@ -958,9 +974,16 @@ class TransformerCritic(Module):
 
         values = inverse_seq(values)
 
-        # reshape for multi-dim output (e.g. quantiles or bins)
+        # reshape for multi-lane rewards and/or multi-dim output (e.g. quantiles or bins)
 
-        if self.dim_out > 1:
+        has_lanes = self.num_reward_lanes > 1
+        greater_one_output_dim = self.dim_out > 1
+
+        if has_lanes and greater_one_output_dim:
+            values = rearrange(values, '... (n r o) -> ... n r o', r = self.num_reward_lanes, o = self.dim_out)
+        elif has_lanes:
+            values = rearrange(values, '... (n r) -> ... n r', r = self.num_reward_lanes)
+        elif greater_one_output_dim:
             values = rearrange(values, '... (n o) -> ... n o', o = self.dim_out)
 
         # wrap in tuple to match Critic return contract (one tensor per action type)
@@ -972,6 +995,10 @@ class TransformerCritic(Module):
 
         return values, state_recon
 
+# multi-critic wrappers with support for Hybrid Reward Architecture (HRA) reward lanes
+# van Seijen et al. https://arxiv.org/abs/1706.04208
+# Russell & Zimdars https://dl.acm.org/doi/10.5555/3041838.3041920
+
 class MultipleCritics(Module):
     @beartype
     def __init__(
@@ -980,11 +1007,16 @@ class MultipleCritics(Module):
         use_softmin = False,
         expectile_l2_loss_tau = 0.5, # regular mse loss if 0.5
         state_recon_loss_weight = 1.0,
-        state_recon_loss_fn: Module = nn.MSELoss()
+        state_recon_loss_fn: Module = nn.MSELoss(),
+        sum_reward_lanes_before_min = False
     ):
         super().__init__()
         assert len(critics) > 0
         assert all([critic.dim_out == 1 for critic in critics]), 'this wrapper only allows for critics that return a single predicted value per action'
+
+        num_reward_lanes = {critic.num_reward_lanes for critic in critics}
+        assert len(num_reward_lanes) == 1, 'critics must all have the same number of reward lanes'
+        self.num_reward_lanes = next(iter(num_reward_lanes))
 
         self.num_critics = len(critics)
         self.one_critic = len(critics) == 1
@@ -1001,17 +1033,30 @@ class MultipleCritics(Module):
 
         self.use_softmin = use_softmin
         self.expectile_l2_loss_tau = expectile_l2_loss_tau
+        self.sum_reward_lanes_before_min = sum_reward_lanes_before_min
+
+    def reduce_critics(self, critic_values):
+        if self.use_softmin:
+            softmin = (-critic_values).softmax(dim = 0)
+            return (softmin * critic_values).sum(dim = 0)
+        elif self.one_critic:
+            return critic_values[0]
+        return torch.minimum(*critic_values)
 
     def forward(
         self,
         states: Float['b ...'],
-        cont_actions: Float['b nc'] | None = None,
-        discrete_actions: Int['b nd'] | None = None,
-        target_values: Float['b n'] | None = None,
+        cont_actions: Float['b ... nc'] | None = None,
+        discrete_actions: Int['b ... nd'] | None = None,
+        target_values: Float['b ...'] | None = None,
+        reward_lane_weights: Float['r'] | None = None,
+        sum_reward_lanes_before_min: bool | None = None,
         return_breakdown = False,
         loss_mask: Bool['b s'] | None = None,
         **kwargs
     ):
+        sum_before_min = default(sum_reward_lanes_before_min, self.sum_reward_lanes_before_min)
+
         raw_critics_values = [critic(states, cont_actions) for critic in self.critics]
 
         if self.has_state_recon:
@@ -1027,16 +1072,19 @@ class MultipleCritics(Module):
             min_critic_values = []
 
             for critic_values in critics_values:
-                if self.use_softmin:
-                    softmin = (-critic_values).softmax(dim = 0)
+                if exists(reward_lane_weights) and self.num_reward_lanes > 1:
+                    # two hypotheses for twin-critic reduction across reward lanes:
+                    # 1. sum_before_min = False (default): per-lane twin min then weighted sum across lanes (prevents cross-lane optimism masking)
+                    # 2. sum_before_min = True: weighted sum across lanes per critic then twin min across critics
 
-                    min_critic_value = (softmin * critic_values).sum(dim = 0)
-
-                elif self.one_critic:
-                    min_critic_value = critic_values[0]
-
+                    if sum_before_min:
+                        weighted = einsum('... r, r -> ...', critic_values, reward_lane_weights)
+                        min_critic_value = self.reduce_critics(weighted)
+                    else:
+                        min_per_lane = self.reduce_critics(critic_values)
+                        min_critic_value = einsum('... r, r -> ...', min_per_lane, reward_lane_weights)
                 else:
-                    min_critic_value = torch.minimum(*critic_values)
+                    min_critic_value = self.reduce_critics(critic_values)
 
                 min_critic_values.append(min_critic_value)
 
@@ -1047,21 +1095,39 @@ class MultipleCritics(Module):
 
         cont_critics_values, *discrete_critics_values = critics_values
 
-        cont_critics_values = pack(cont_critics_values, 'c b * n') if not is_empty(cont_critics_values) else None
+        if self.num_reward_lanes > 1:
+            cont_critics_values = pack(cont_critics_values, 'c b * n r') if not is_empty(cont_critics_values) else None
 
-        if exists(discrete_actions):
-            discrete_critics_values = [pack(dcv, 'c b * n') for dcv in discrete_critics_values]
-            discrete_actions = pack(discrete_actions, 'b * nd')
-            discrete_critics_values = [get_at('c b s [l], b s -> c b s', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+            if exists(discrete_actions):
+                discrete_critics_values = [pack(dcv, 'c b * n r') for dcv in discrete_critics_values]
+                discrete_actions = pack(discrete_actions, 'b * nd')
+                discrete_critics_values = [get_at('c b s [l] r, b s -> c b s r', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
-        values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s *')
+            values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s * r')
 
-        target_values = pack(target_values, 'b * d')
-        target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
+            target_values = pack(target_values, 'b * d r')
+            target_values = repeat(target_values, 'b s d r -> c b s d r', c = self.num_critics)
 
-        losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
+            losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
 
-        losses = reduce(losses, 'c b s n -> b s', 'sum')
+            losses = reduce(losses, 'c b s n r -> b s', 'sum')
+        else:
+            cont_critics_values = pack(cont_critics_values, 'c b * n') if not is_empty(cont_critics_values) else None
+
+            if exists(discrete_actions):
+                discrete_critics_values = [pack(dcv, 'c b * n') for dcv in discrete_critics_values]
+                discrete_actions = pack(discrete_actions, 'b * nd')
+                discrete_critics_values = [get_at('c b s [l], b s -> c b s', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+
+            values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s *')
+
+            target_values = pack(target_values, 'b * d')
+            target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
+
+            losses = expectile_l2_loss(values, target_values, tau = self.expectile_l2_loss_tau, reduction = 'none')
+
+            losses = reduce(losses, 'c b s n -> b s', 'sum')
+
         reduced_losses = masked_mean(losses, loss_mask)
 
         if self.has_state_recon:
@@ -1082,13 +1148,19 @@ class MultipleCriticsWithClassificationLoss(Module):
         hl_gauss_loss: dict | HLGaussLossFromSupport,
         use_softmin = False,
         state_recon_loss_weight = 1.0,
-        state_recon_loss_fn: Module = nn.MSELoss()
+        state_recon_loss_fn: Module = nn.MSELoss(),
+        sum_reward_lanes_before_min = False
     ):
         super().__init__()
         assert len(critics) > 0
         assert all([critic.dim_out > 1 for critic in critics]), 'the critic must return multiple bins for classification loss'
 
+        num_reward_lanes = {critic.num_reward_lanes for critic in critics}
+        assert len(num_reward_lanes) == 1, 'critics must all have the same number of reward lanes'
+        self.num_reward_lanes = next(iter(num_reward_lanes))
+
         self.num_critics = len(critics)
+        self.one_critic = len(critics) == 1
         self.critics = ModuleList(critics)
 
         has_state_recons = tuple(critic.state_recon for critic in critics)
@@ -1096,6 +1168,7 @@ class MultipleCriticsWithClassificationLoss(Module):
         self.has_state_recon = has_state_recons[0]
 
         self.use_softmin = use_softmin
+        self.sum_reward_lanes_before_min = sum_reward_lanes_before_min
 
         # maybe state recon loss
 
@@ -1107,16 +1180,28 @@ class MultipleCriticsWithClassificationLoss(Module):
 
         self.hl_gauss_loss = hl_gauss_loss
 
+    def reduce_critics(self, critic_values):
+        if self.use_softmin:
+            softmin = (-critic_values).softmax(dim = 0)
+            return (softmin * critic_values).sum(dim = 0)
+        elif self.one_critic:
+            return critic_values[0]
+        return torch.minimum(*critic_values)
+
     def forward(
         self,
         states: Float['b ...'],
-        cont_actions: Float['b nc'] | None = None,
-        discrete_actions: Int['b nd'] | None = None,
-        target_values: Float['b n'] | None = None,
+        cont_actions: Float['b ... nc'] | None = None,
+        discrete_actions: Int['b ... nd'] | None = None,
+        target_values: Float['b ...'] | None = None,
+        reward_lane_weights: Float['r'] | None = None,
+        sum_reward_lanes_before_min: bool | None = None,
         return_breakdown = False,
         loss_mask: Bool['b s'] | None = None,
         **kwargs
     ):
+        sum_before_min = default(sum_reward_lanes_before_min, self.sum_reward_lanes_before_min)
+
         raw_critics_values = [critic(states, cont_actions) for critic in self.critics]
 
         if self.has_state_recon:
@@ -1142,12 +1227,19 @@ class MultipleCriticsWithClassificationLoss(Module):
             min_critic_values = []
 
             for critic_values in critics_values:
-                if self.use_softmin:
-                    softmin = (-critic_values).softmax(dim = 0)
+                if exists(reward_lane_weights) and self.num_reward_lanes > 1:
+                    # two hypotheses for twin-critic reduction across reward lanes:
+                    # 1. sum_before_min = False (default): per-lane twin min then weighted sum across lanes (prevents cross-lane optimism masking)
+                    # 2. sum_before_min = True: weighted sum across lanes per critic then twin min across critics
 
-                    min_critic_value = (softmin * critic_values).sum(dim = 0)
+                    if sum_before_min:
+                        weighted = einsum('... r, r -> ...', critic_values, reward_lane_weights)
+                        min_critic_value = self.reduce_critics(weighted)
+                    else:
+                        min_per_lane = self.reduce_critics(critic_values)
+                        min_critic_value = einsum('... r, r -> ...', min_per_lane, reward_lane_weights)
                 else:
-                    min_critic_value = torch.minimum(*critic_values)
+                    min_critic_value = self.reduce_critics(critic_values)
 
                 min_critic_values.append(min_critic_value)
 
@@ -1158,23 +1250,41 @@ class MultipleCriticsWithClassificationLoss(Module):
 
         cont_critics_values, *discrete_critics_values = binned_critics_values
 
-        cont_critics_values = pack(cont_critics_values, 'c b * n bins') if not is_empty(cont_critics_values) else None
+        if self.num_reward_lanes > 1:
+            cont_critics_values = pack(cont_critics_values, 'c b * n r bins') if not is_empty(cont_critics_values) else None
 
-        if exists(discrete_actions):
-            discrete_critics_values = [pack(dcv, 'c b * n bins') for dcv in discrete_critics_values]
-            discrete_actions = pack(discrete_actions, 'b * nd')
-            discrete_critics_values = [get_at('c b s [l] bins, b s -> c b s bins', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+            if exists(discrete_actions):
+                discrete_critics_values = [pack(dcv, 'c b * n r bins') for dcv in discrete_critics_values]
+                discrete_actions = pack(discrete_actions, 'b * nd')
+                discrete_critics_values = [get_at('c b s [l] r bins, b s -> c b s r bins', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
 
-        values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s * bins')
+            values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s * r bins')
 
-        target_values = pack(target_values, 'b * d')
-        target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
+            target_values = pack(target_values, 'b * d r')
+            target_values = repeat(target_values, 'b s d r -> c b s d r', c = self.num_critics)
 
-        # from "Stop Regressing" paper out of deepmind, Farebrother et al
+            cross_entropy_losses = self.hl_gauss_loss(values, target_values, reduction = 'none')
 
-        cross_entropy_losses = self.hl_gauss_loss(values, target_values, reduction = 'none')
+            cross_entropy_losses = reduce(cross_entropy_losses, 'c b s n r -> b s', 'sum')
+        else:
+            cont_critics_values = pack(cont_critics_values, 'c b * n bins') if not is_empty(cont_critics_values) else None
 
-        cross_entropy_losses = reduce(cross_entropy_losses, 'c b s n -> b s', 'sum')
+            if exists(discrete_actions):
+                discrete_critics_values = [pack(dcv, 'c b * n bins') for dcv in discrete_critics_values]
+                discrete_actions = pack(discrete_actions, 'b * nd')
+                discrete_critics_values = [get_at('c b s [l] bins, b s -> c b s bins', dcv, da) for dcv, da in zip(discrete_critics_values, discrete_actions.unbind(dim = -1))]
+
+            values = pack(compact([cont_critics_values, *discrete_critics_values]), 'c b s * bins')
+
+            target_values = pack(target_values, 'b * d')
+            target_values = repeat(target_values, 'b s d -> c b s d', c = self.num_critics)
+
+            # from "Stop Regressing" paper out of deepmind, Farebrother et al
+
+            cross_entropy_losses = self.hl_gauss_loss(values, target_values, reduction = 'none')
+
+            cross_entropy_losses = reduce(cross_entropy_losses, 'c b s n -> b s', 'sum')
+
         reduced_losses = masked_mean(cross_entropy_losses, loss_mask)
 
         if self.has_state_recon:
@@ -1195,17 +1305,23 @@ class MultipleQuantileCritics(Module):
         quantiles: list[float] | Tensor | None = None,
         frac_atom_keep = 0.75, # will truncate 25% of the top values
         state_recon_loss_weight = 1.0,
-        state_recon_loss_fn: Module = nn.MSELoss()
+        state_recon_loss_fn: Module = nn.MSELoss(),
+        sum_reward_lanes_before_min = False
     ):
         super().__init__()
         assert len(critics) > 0
         assert all([critic.dim_out > 1 for critic in critics]), 'all critics must be returning greater than one output dimension, assumed as quantiles'
         assert len(set([critic.dim_out for critic in critics])) == 1, 'all critics must have same number of output dimensions for quantiled training'
 
+        num_reward_lanes = {critic.num_reward_lanes for critic in critics}
+        assert len(num_reward_lanes) == 1, 'critics must all have the same number of reward lanes'
+        self.num_reward_lanes = next(iter(num_reward_lanes))
+
         self.num_critics = len(critics)
 
         self.critics = ModuleList(critics)
         self.num_atom_keep = int(frac_atom_keep * self.num_critics * self.num_quantiles)
+        self.sum_reward_lanes_before_min = sum_reward_lanes_before_min
 
         # maybe state recon aux loss
 
@@ -1229,13 +1345,17 @@ class MultipleQuantileCritics(Module):
     def forward(
         self,
         states: Float['b ...'],
-        cont_actions: Float['b nc'] | None = None,
-        discrete_actions: Int['b nd'] | None = None,
-        target_values: Float['b n q'] | None = None,
+        cont_actions: Float['b ... nc'] | None = None,
+        discrete_actions: Int['b ... nd'] | None = None,
+        target_values: Float['b ... q'] | None = None,
+        reward_lane_weights: Float['r'] | None = None,
+        sum_reward_lanes_before_min: bool | None = None,
         truncate_quantiles_across_critics = False,
         return_breakdown = False,
         loss_mask: Bool['b s'] | None = None
     ):
+        sum_before_min = default(sum_reward_lanes_before_min, self.sum_reward_lanes_before_min)
+
         raw_critics_quantile_atoms = [critic(states, cont_actions) for critic in self.critics]
 
         if self.has_state_recon:
@@ -1252,12 +1372,18 @@ class MultipleQuantileCritics(Module):
                 truncated_means_per_action = []
 
                 for critic_quantile_atoms in critics_quantile_atoms:
+                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and sum_before_min:
+                        critic_quantile_atoms = einsum('... r q, r -> ... q', critic_quantile_atoms, reward_lane_weights)
+
                     quantile_atoms = rearrange(critic_quantile_atoms, 'c b ... q -> b ... (q c)')
 
                     # mean of the truncated distribution
 
                     truncated_quantiles = quantile_atoms.topk(self.num_atom_keep, largest = False).values
                     truncated_mean = truncated_quantiles.mean(dim = -1)
+
+                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and not sum_before_min:
+                        truncated_mean = einsum('... r, r -> ...', truncated_mean, reward_lane_weights)
 
                     truncated_means_per_action.append(truncated_mean)
 
@@ -1267,7 +1393,14 @@ class MultipleQuantileCritics(Module):
                 min_critic_value_per_action = []
 
                 for critic_quantile_atoms in critics_quantile_atoms:
+                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and sum_before_min:
+                        critic_quantile_atoms = einsum('... r q, r -> ... q', critic_quantile_atoms, reward_lane_weights)
+
                     min_critic_value = torch.minimum(*critic_quantile_atoms)
+
+                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and not sum_before_min:
+                        min_critic_value = einsum('... r q, r -> ... q', min_critic_value, reward_lane_weights)
+
                     min_critic_value_per_action.append(min_critic_value)
 
                 return_value = min_critic_value_per_action
@@ -1279,28 +1412,49 @@ class MultipleQuantileCritics(Module):
 
         cont_quantile_atoms, *discrete_quantile_atoms = critics_quantile_atoms
 
-        cont_quantile_atoms = pack(cont_quantile_atoms, 'c b * n q') if not is_empty(cont_quantile_atoms) else None
+        if self.num_reward_lanes > 1:
+            cont_quantile_atoms = pack(cont_quantile_atoms, 'c b * n r q') if not is_empty(cont_quantile_atoms) else None
 
-        if exists(discrete_actions):
-            discrete_quantile_atoms = [pack(dqa, 'c b * n q') for dqa in discrete_quantile_atoms]
-            discrete_actions = pack(discrete_actions, 'b * nd')
-            discrete_quantile_atoms = [get_at('c b s [l] q, b s -> c b s q', dqa, da) for dqa, da in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
+            if exists(discrete_actions):
+                discrete_quantile_atoms = [pack(dqa, 'c b * n r q') for dqa in discrete_quantile_atoms]
+                discrete_actions = pack(discrete_actions, 'b * nd')
+                discrete_quantile_atoms = [get_at('c b s [l] r q, b s -> c b s r q', dqa, da) for dqa, da in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
 
-        quantile_atoms = pack(compact([cont_quantile_atoms, *discrete_quantile_atoms]), 'c b s * q')
+            quantile_atoms = pack(compact([cont_quantile_atoms, *discrete_quantile_atoms]), 'c b s * r q')
 
-        target_values = pack(target_values, 'b * d q')
-        target_values = repeat(target_values, 'b s d q -> c b s d q', c = self.num_critics)
+            target_values = pack(target_values, 'b * d r q')
+            target_values = repeat(target_values, 'b s d r q -> c b s d r q', c = self.num_critics)
 
-        # quantile regression if training
+            quantiles = self.quantiles
 
-        quantiles = self.quantiles
+            error = target_values - quantile_atoms
+            losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
 
-        # quantile regression loss
+            losses = reduce(losses, 'c b s n r q -> b s', 'sum')
+        else:
+            cont_quantile_atoms = pack(cont_quantile_atoms, 'c b * n q') if not is_empty(cont_quantile_atoms) else None
 
-        error = target_values - quantile_atoms
-        losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
+            if exists(discrete_actions):
+                discrete_quantile_atoms = [pack(dqa, 'c b * n q') for dqa in discrete_quantile_atoms]
+                discrete_actions = pack(discrete_actions, 'b * nd')
+                discrete_quantile_atoms = [get_at('c b s [l] q, b s -> c b s q', dqa, da) for dqa, da in zip(discrete_quantile_atoms, discrete_actions.unbind(dim = -1))]
 
-        losses = reduce(losses, 'c b s n q -> b s', 'sum')
+            quantile_atoms = pack(compact([cont_quantile_atoms, *discrete_quantile_atoms]), 'c b s * q')
+
+            target_values = pack(target_values, 'b * d q')
+            target_values = repeat(target_values, 'b s d q -> c b s d q', c = self.num_critics)
+
+            # quantile regression if training
+
+            quantiles = self.quantiles
+
+            # quantile regression loss
+
+            error = target_values - quantile_atoms
+            losses = torch.maximum(error * quantiles, error * (quantiles - 1.))
+
+            losses = reduce(losses, 'c b s n q -> b s', 'sum')
+
         reduced_losses = masked_mean(losses, loss_mask)
 
         if self.has_state_recon:
@@ -1391,6 +1545,8 @@ class SAC(Module):
         hl_gauss_loss: dict | HLGaussLossFromSupport | None = None,
         reward_discount_rate = 0.99,
         reward_scale = 1.,
+        reward_lane_weights: tuple[float, ...] | list[float] | Tensor | None = None,
+        sum_reward_lanes_before_min = False,
         actor_learning_rate = 3e-4,
         actor_regen_reg_rate = 1e-4,
         critic_target_ema_decay = 0.99,
@@ -1457,30 +1613,38 @@ class SAC(Module):
             critic_klass = TransformerCritic if transformer_critic else Critic
             critics = [critic_klass(**critic) for critic in critics]
 
-        critic_dim_outs = {critic.dim_out for critic in critics}
-
-        assert len(critic_dim_outs) == 1, 'critics must all have the same output dimension'
-
-        critic_dim_out = list(critic_dim_outs)[0]
-
-        critic_kwargs = dict()
-
-        if critic_dim_out == 1:
-            critic_klass = MultipleCritics
-            critic_kwargs = multiple_critics_kwargs
-        elif critic_dim_out > 1 and not quantiled_critics:
-            assert exists(hl_gauss_loss), 'hl_gauss_loss must be set'
-            critic_klass = MultipleCriticsWithClassificationLoss
-            critic_kwargs = dict(hl_gauss_loss = hl_gauss_loss)
-        else:
-            critic_klass = MultipleQuantileCritics
-
         if is_bearable(critics, list[Critic]) or is_bearable(critics, list[TransformerCritic]):
+            critic_dim_outs = {critic.dim_out for critic in critics}
+            assert len(critic_dim_outs) == 1, 'critics must all have the same output dimension'
+            critic_dim_out = list(critic_dim_outs)[0]
+
+            critic_kwargs = dict(sum_reward_lanes_before_min = sum_reward_lanes_before_min)
+
+            if critic_dim_out == 1:
+                critic_klass = MultipleCritics
+                critic_kwargs = critic_kwargs | multiple_critics_kwargs
+            elif critic_dim_out > 1 and not quantiled_critics:
+                assert exists(hl_gauss_loss), 'hl_gauss_loss must be set'
+                critic_klass = MultipleCriticsWithClassificationLoss
+                critic_kwargs = critic_kwargs | dict(hl_gauss_loss = hl_gauss_loss)
+            else:
+                critic_klass = MultipleQuantileCritics
+
             critics = critic_klass(*critics, **critic_kwargs, state_recon_loss_weight = critic_state_recon_loss_weight, state_recon_loss_fn = state_recon_loss_fn)
 
-        assert isinstance(critics, critic_klass), f'expected {critic_klass.__name__} but received critics wrapped with {type(critics).__name__}'
-
         self.critics = critics
+        self.num_reward_lanes = critics.num_reward_lanes
+        self.sum_reward_lanes_before_min = critics.sum_reward_lanes_before_min
+
+        # reward lane weights for policy extraction - defaults to all ones (1., 1., ...)
+
+        if not exists(reward_lane_weights):
+            reward_lane_weights = torch.ones(self.num_reward_lanes)
+        elif not isinstance(reward_lane_weights, Tensor):
+            reward_lane_weights = tensor(reward_lane_weights, dtype = torch.float32)
+
+        assert reward_lane_weights.shape == (self.num_reward_lanes,), f'reward_lane_weights must have shape ({self.num_reward_lanes},), got {tuple(reward_lane_weights.shape)}'
+        self.register_buffer('reward_lane_weights', reward_lane_weights.float())
 
         self.quantiled_critics = quantiled_critics
 
@@ -1552,6 +1716,15 @@ class SAC(Module):
 
         self.assoc_scan = AssocScan(reverse = True)
 
+    def set_reward_lane_weights(
+        self,
+        weights: tuple[float, ...] | list[float] | Tensor
+    ):
+        if not isinstance(weights, Tensor):
+            weights = tensor(weights, dtype = torch.float32, device = self.reward_lane_weights.device)
+        assert weights.shape == (self.num_reward_lanes,), f'expected shape ({self.num_reward_lanes},), got {tuple(weights.shape)}'
+        self.reward_lane_weights.copy_(weights)
+
     @torch.no_grad()
     def apply_fire_(
         self,
@@ -1570,19 +1743,109 @@ class SAC(Module):
             if exists(self.critics_target):
                 self.critics_target.copy_params_from_model_to_ema()
 
+    def update_actor(
+        self,
+        states: Float['b ...'],
+        cont_actions: Float['b ... nc'] | None = None,
+        next_states: Float['b ...'] | None = None,
+        rewards: Float['b ...'] | None = None,
+        reward_lane_weights: tuple[float, ...] | list[float] | Tensor | None = None,
+        sum_reward_lanes_before_min: bool | None = None
+    ):
+        """
+        policy extraction step - optimizes actor against the critic's reward lanes
+        weighted by `reward_lane_weights` (defaults to `self.reward_lane_weights`, all ones)
+        """
+        if exists(reward_lane_weights) and not isinstance(reward_lane_weights, Tensor):
+            reward_lane_weights = tensor(reward_lane_weights, dtype = torch.float32, device = states.device)
+
+        lane_weights = default(reward_lane_weights, self.reward_lane_weights)
+        entropy_temp = self.learned_entropy_temperature.alpha.detach()
+
+        actor_output = self.actor(states, sample = True, cont_reparametrize = True)
+
+        cont_entropy = actor_output.continuous_entropy
+        discrete_logits = actor_output.discrete_action_logits
+
+        self.critics.requires_grad_(False)
+
+        cont_q_values, *discrete_q_values = self.critics(
+            states,
+            cont_actions = actor_output.continuous,
+            discrete_actions = actor_output.discrete,
+            reward_lane_weights = lane_weights,
+            sum_reward_lanes_before_min = sum_reward_lanes_before_min,
+            truncate_quantiles_across_critics = True
+        )
+
+        actor_action_losses = []
+
+        if exists(cont_entropy):
+            cont_entropy_summed = cont_entropy.sum(dim = -1, keepdim = True)
+            cont_action_loss = (-entropy_temp * cont_entropy_summed - cont_q_values).mean()
+
+            actor_action_losses.append(cont_action_loss)
+
+        for discrete_logit, one_discrete_q_value in zip(discrete_logits, discrete_q_values):
+            discrete_prob = discrete_logit.softmax(dim = -1)
+            discrete_log_prob = log(discrete_prob)
+
+            one_discrete_actor_loss = (discrete_prob * (entropy_temp * discrete_log_prob - one_discrete_q_value)).sum(dim = -1).mean()
+
+            actor_action_losses.append(one_discrete_actor_loss)
+
+        total_actor_loss = sum(actor_action_losses)
+
+        if self.actor.state_recon:
+            actor_state_recon_loss = self.state_recon_loss_fn(actor_output.state_recon, states)
+            total_actor_loss = total_actor_loss + actor_state_recon_loss * self.actor_state_recon_loss_weight
+
+        if self.actor.spr and exists(cont_actions) and exists(next_states) and states.ndim == 2:
+            spr_reward = reduce(rewards, 'b ... -> b', 'mean') if exists(rewards) else None
+            actor_spr_loss = self.actor.spr_loss(states, cont_actions, next_states, reward = spr_reward)
+            total_actor_loss = total_actor_loss + actor_spr_loss * self.actor_spr_loss_weight
+
+        total_actor_loss.backward()
+        self.critics.requires_grad_(True)
+
+        self.actor_optimizer.step()
+        self.actor_optimizer.zero_grad()
+
+        # update the learned entropy temperature
+
+        temperature_loss = self.learned_entropy_temperature(
+            cont_entropy = cont_entropy,
+            discrete_logits = discrete_logits
+        )
+
+        temperature_loss.backward()
+        self.temperature_optimizer.step()
+        self.temperature_optimizer.zero_grad()
+
+        return total_actor_loss
+
     def forward(
         self,
         states: Float['b ...'],
-        cont_actions: Float['b nc'],
-        discrete_actions: Int['b nd'],
-        rewards: Float['b'],
-        done: Bool['b'],
+        cont_actions: Float['b ... nc'] | None,
+        discrete_actions: Int['b ... nd'] | None,
+        rewards: Float['b ...'],
+        done: Bool['b ...'],
         next_states: Float['b ...'],
-        n_step_lens: Int['b'] | None = None
+        n_step_lens: Int['b'] | None = None,
+        reward_lane_weights: tuple[float, ...] | list[float] | Tensor | None = None,
+        sum_reward_lanes_before_min: bool | None = None
     ):
+        has_lanes = self.num_reward_lanes > 1
+
         # pack sequence dimension - base case is always seq of 1
 
-        rewards = pack(rewards, 'b *')
+        if has_lanes:
+            assert rewards.shape[-1] == self.num_reward_lanes, f'expected rewards to have {self.num_reward_lanes} reward lanes on last dimension, but got {rewards.shape[-1]}'
+            rewards = pack(rewards, 'b * r')
+        else:
+            rewards = pack(rewards, 'b *')
+
         done = pack(done, 'b *')
 
         seq_len = rewards.shape[1]
@@ -1601,8 +1864,6 @@ class SAC(Module):
         rewards = rewards * self.reward_scale
 
         # bellman equation
-
-        entropy_temp = self.learned_entropy_temperature.alpha.detach()
 
         γ = self.reward_discount_rate
         not_terminal = (~done).float()
@@ -1633,9 +1894,9 @@ class SAC(Module):
 
                 self.critics.train(was_training)
 
-        # learned temperature - detached
+        # learned temperature - detached (split evenly across reward lanes so all-ones sum preserves total entropy weight)
 
-        learned_entropy_weight = self.learned_entropy_temperature.alpha.detach()
+        learned_entropy_weight = self.learned_entropy_temperature.alpha.detach() / self.num_reward_lanes
 
         next_soft_state_values = []
 
@@ -1643,6 +1904,9 @@ class SAC(Module):
 
         if exists(next_cont_log_prob):
             next_cont_log_prob = next_cont_log_prob.sum(dim = -1, keepdim = True)
+
+            if has_lanes:
+                next_cont_log_prob = rearrange(next_cont_log_prob, '... -> ... 1')
 
             if self.quantiled_critics:
                 next_cont_log_prob = rearrange(next_cont_log_prob, '... -> ... 1')
@@ -1658,6 +1922,10 @@ class SAC(Module):
                 next_discrete_prob = next_discrete_logit.softmax(dim = -1)
                 next_discrete_log_prob = log(next_discrete_prob)
 
+                if has_lanes:
+                    next_discrete_prob = rearrange(next_discrete_prob, '... -> ... 1')
+                    next_discrete_log_prob = rearrange(next_discrete_log_prob, '... -> ... 1')
+
                 if self.quantiled_critics:
                     next_discrete_prob = rearrange(next_discrete_prob, '... -> ... 1')
                     next_discrete_log_prob = rearrange(next_discrete_log_prob, '... -> ... 1')
@@ -1667,7 +1935,15 @@ class SAC(Module):
 
         # pack soft state values and expand rewards / done for broadcasting
 
-        if self.quantiled_critics:
+        if has_lanes and self.quantiled_critics:
+            next_soft_state_values = pack(next_soft_state_values, 'b * r q')
+            rewards = rearrange(rewards, 'b s r -> b s 1 r 1')
+            not_terminal = rearrange(not_terminal, 'b s -> b s 1 1 1')
+        elif has_lanes:
+            next_soft_state_values = pack(next_soft_state_values, 'b * r')
+            rewards = rearrange(rewards, 'b s r -> b s 1 r')
+            not_terminal = rearrange(not_terminal, 'b s -> b s 1 1')
+        elif self.quantiled_critics:
             next_soft_state_values = pack(next_soft_state_values, 'b * q')
             rewards = rearrange(rewards, 'b s -> b s 1 1')
             not_terminal = rearrange(not_terminal, 'b s -> b s 1 1')
@@ -1684,7 +1960,7 @@ class SAC(Module):
             n_step_lens = torch.full((b,), seq_len, device = rewards.device, dtype = torch.long)
 
         next_soft_state_values = rearrange(next_soft_state_values, 'b ... -> b 1 ...')
-        rewards = rewards.repeat(1, 1, *next_soft_state_values.shape[2:])
+        rewards = rewards.expand(b, seq_len, *next_soft_state_values.shape[2:]).clone()
 
         inputs = cat((rewards, torch.zeros_like(rewards[:, :1])), dim = 1)
         batch_indices = torch.arange(b, device = rewards.device)
@@ -1733,65 +2009,14 @@ class SAC(Module):
         self.critics_optimizer.zero_grad()
 
         if divisible_by(int(self.step.item()), self.actor_update_freq):
-
-            # update the actor
-
-            actor_output = self.actor(states, sample = True, cont_reparametrize = True)
-
-            cont_entropy = actor_output.continuous_entropy
-            discrete_logits = actor_output.discrete_action_logits
-
-            self.critics.requires_grad_(False)
-
-            cont_q_values, *discrete_q_values = self.critics(
-                states,
-                cont_actions = actor_output.continuous,
-                discrete_actions = actor_output.discrete,
-                truncate_quantiles_across_critics = True
+            self.update_actor(
+                states = states,
+                cont_actions = cont_actions,
+                next_states = next_states,
+                rewards = rewards,
+                reward_lane_weights = reward_lane_weights,
+                sum_reward_lanes_before_min = sum_reward_lanes_before_min
             )
-
-            actor_action_losses = []
-
-            if exists(cont_entropy):
-                cont_entropy_summed = cont_entropy.sum(dim = -1, keepdim = True)
-                cont_action_loss = (-entropy_temp * cont_entropy_summed - cont_q_values).mean()
-
-                actor_action_losses.append(cont_action_loss)
-
-            for discrete_logit, one_discrete_q_value in zip(discrete_logits, discrete_q_values):
-                discrete_prob = discrete_logit.softmax(dim = -1)
-                discrete_log_prob = log(discrete_prob)
-
-                one_discrete_actor_loss = (discrete_prob * (entropy_temp * discrete_log_prob - one_discrete_q_value)).sum(dim = -1).mean()
-
-                actor_action_losses.append(one_discrete_actor_loss)
-
-            total_actor_loss = sum(actor_action_losses)
-
-            if self.actor.state_recon:
-                actor_state_recon_loss = self.state_recon_loss_fn(actor_output.state_recon, states)
-                total_actor_loss = total_actor_loss + actor_state_recon_loss * self.actor_state_recon_loss_weight
-
-            if self.actor.spr and exists(cont_actions) and states.ndim == 2:
-                actor_spr_loss = self.actor.spr_loss(states, cont_actions, next_states, reward = reduce(rewards, 'b ... -> b', 'mean'))
-                total_actor_loss = total_actor_loss + actor_spr_loss * self.actor_spr_loss_weight
-
-            total_actor_loss.backward()
-            self.critics.requires_grad_(True)
-
-            self.actor_optimizer.step()
-            self.actor_optimizer.zero_grad()
-
-            # update the learned entropy temperature
-
-            temperature_loss = self.learned_entropy_temperature(
-                cont_entropy = cont_entropy,
-                discrete_logits = discrete_logits
-            )
-
-            temperature_loss.backward()
-            self.temperature_optimizer.step()
-            self.temperature_optimizer.zero_grad()
 
         # increment step, update ema
 
