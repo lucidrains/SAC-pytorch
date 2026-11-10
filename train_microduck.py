@@ -531,6 +531,9 @@ def main(
     num_reward_lanes:            int = 2,
     reward_lane_weights:         tuple[float, ...] | None = None,
     sum_reward_lanes_before_min: bool = False,
+    use_soft_mellowmax:          bool = False,
+    soft_mellowmax_temperature:  float = 1.,
+    soft_mellowmax_alpha:        float = 0.,
     dim_hidden:                  int = 128,
     mlp_depth:                   int = 2,
     batch_size:                  int = 64,
@@ -571,6 +574,9 @@ def main(
     if num_reward_lanes >= 2 and num_critics >= 2:
         init_critic_(critics[0], lane_targets = ((1.25, 1.00), (0.76, 1.00)), lane_curvatures = (400.0, 13.0), lane_biases = (+80.0, -0.20))
         init_critic_(critics[1], lane_targets = ((1.05, 1.00), (1.25, 1.00)), lane_curvatures = ( 30.0, 400.0), lane_biases = (-0.20, +80.0))
+    elif num_reward_lanes >= 2:
+        # one critic covers both lanes - match the effective min-of-two-critics surfaces
+        init_critic_(critics[0], lane_targets = ((1.05, 1.00), (0.76, 1.00)), lane_curvatures = (30.0, 13.0), lane_biases = (-0.20, -0.20))
     else:
         for c in critics:
             init_critic_(c, lane_targets = ((0.85, 0.92),), lane_curvatures = (25.0,), lane_biases = (-0.20,))
@@ -580,6 +586,9 @@ def main(
         critics = critics,
         reward_lane_weights = reward_lane_weights,
         sum_reward_lanes_before_min = sum_reward_lanes_before_min,
+        use_soft_mellowmax = use_soft_mellowmax,
+        soft_mellowmax_temperature = soft_mellowmax_temperature,
+        soft_mellowmax_alpha = soft_mellowmax_alpha,
         reward_discount_rate = gamma,
         actor_learning_rate = actor_lr,
         actor_regen_reg_rate = actor_regen_reg_rate,
@@ -637,9 +646,12 @@ def main(
     # training loop
 
     agg_mode = 'sum_then_min (Hyp 2)' if sum_reward_lanes_before_min else 'min_then_sum (Hyp 1)'
+    if use_soft_mellowmax:
+        agg_mode = f'soft_mellowmax (T={soft_mellowmax_temperature:g})'
+
     init_eval = evaluate_gait(eval_env, agent, seeds = (0, 1, 2), noisy = True, device = device)
     print(
-        f"[Init Eval | lanes={num_reward_lanes} | agg={agg_mode} | target_pm={target_pm:.2f}] "
+        f"[Init Eval | lanes={num_reward_lanes} | critics={num_critics} | agg={agg_mode} | target_pm={target_pm:.2f}] "
         f"steps: {init_eval['steps']:.1f}/{max_steps_per_episode} "
         f"(min {init_eval['min_steps']:.0f}) | x: {init_eval['x']:+.3f}m "
         f"(min {init_eval['min_x']:+.3f}m) | abs_y: {init_eval['abs_y']:.3f}m | ret: {init_eval['ret']:.1f}"

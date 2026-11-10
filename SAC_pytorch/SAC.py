@@ -995,6 +995,48 @@ class TransformerCritic(Module):
 
         return values, state_recon
 
+# mellowmax operators
+# mellowmax - Asadi & Littman https://arxiv.org/abs/1612.05628
+# soft mellowmax (SM2) - Gan et al. https://arxiv.org/abs/2012.09456
+# mm_w(Q) = (1 / w) log(mean_i exp(w Q_i))
+# sm_w(Q) = (1 / w) log(sum_i softmax(alpha Q)_i exp(w Q_i))
+# both interpolate between the mean and the max as the temperature grows
+# soft mellowmax adds a per-value weight through alpha
+
+def soft_mellowmax(
+    t,
+    temperature = 1.,
+    alpha = 0.,
+    dim = 0
+):
+    assert temperature > 0.
+
+    log_weights = (t * alpha).log_softmax(dim = dim)
+    return torch.logsumexp(t * temperature + log_weights, dim = dim) / temperature
+
+def mellowmax(
+    t,
+    temperature = 1.,
+    dim = 0
+):
+    return soft_mellowmax(t, temperature = temperature, alpha = 0., dim = dim)
+
+def soft_mellowmax_min(
+    t,
+    temperature = 1.,
+    alpha = 0.,
+    dim = 0
+):
+    """pessimistic soft mellowmax - interpolates between mean (temperature -> 0) and min (temperature -> inf)"""
+    return -soft_mellowmax(-t, temperature = temperature, alpha = alpha, dim = dim)
+
+def mellowmax_min(
+    t,
+    temperature = 1.,
+    dim = 0
+):
+    return -mellowmax(-t, temperature = temperature, dim = dim)
+
 # multi-critic wrappers with support for Hybrid Reward Architecture (HRA) reward lanes
 # van Seijen et al. https://arxiv.org/abs/1706.04208
 # Russell & Zimdars https://dl.acm.org/doi/10.5555/3041838.3041920
@@ -1005,6 +1047,9 @@ class MultipleCritics(Module):
         self,
         *critics: Critic | TransformerCritic,
         use_softmin = False,
+        use_soft_mellowmax = False,
+        soft_mellowmax_temperature = 1.,
+        soft_mellowmax_alpha = 0.,
         expectile_l2_loss_tau = 0.5, # regular mse loss if 0.5
         state_recon_loss_weight = 1.0,
         state_recon_loss_fn: Module = nn.MSELoss(),
@@ -1022,6 +1067,12 @@ class MultipleCritics(Module):
         self.one_critic = len(critics) == 1
         self.critics = ModuleList(critics)
 
+        assert not (use_softmin and use_soft_mellowmax), 'choose either softmin or soft mellowmax'
+        assert not (use_soft_mellowmax and sum_reward_lanes_before_min), 'soft mellowmax already aggregates reward lanes'
+
+        if use_soft_mellowmax:
+            assert self.one_critic, 'soft mellowmax is only supported with a single critic'
+
         # maybe state recon loss
 
         has_state_recons = tuple(critic.state_recon for critic in critics)
@@ -1032,6 +1083,9 @@ class MultipleCritics(Module):
         self.state_recon_loss_fn = state_recon_loss_fn
 
         self.use_softmin = use_softmin
+        self.use_soft_mellowmax = use_soft_mellowmax
+        self.soft_mellowmax_temperature = soft_mellowmax_temperature
+        self.soft_mellowmax_alpha = soft_mellowmax_alpha
         self.expectile_l2_loss_tau = expectile_l2_loss_tau
         self.sum_reward_lanes_before_min = sum_reward_lanes_before_min
 
@@ -1043,6 +1097,24 @@ class MultipleCritics(Module):
             return critic_values[0]
         return torch.minimum(*critic_values)
 
+    def reduce_reward_lanes(
+        self,
+        lane_values,
+        reward_lane_weights = None,
+        lane_dim = -1
+    ):
+        if exists(reward_lane_weights):
+            shape = [1] * lane_values.ndim
+            shape[lane_dim] = -1
+            lane_values = lane_values * reward_lane_weights.view(*shape)
+
+        return soft_mellowmax_min(
+            lane_values,
+            temperature = self.soft_mellowmax_temperature,
+            alpha = self.soft_mellowmax_alpha,
+            dim = lane_dim
+        )
+
     def forward(
         self,
         states: Float['b ...'],
@@ -1051,6 +1123,7 @@ class MultipleCritics(Module):
         target_values: Float['b ...'] | None = None,
         reward_lane_weights: Float['r'] | None = None,
         sum_reward_lanes_before_min: bool | None = None,
+        aggregate_reward_lanes = True,
         return_breakdown = False,
         loss_mask: Bool['b s'] | None = None,
         **kwargs
@@ -1072,7 +1145,10 @@ class MultipleCritics(Module):
             min_critic_values = []
 
             for critic_values in critics_values:
-                if exists(reward_lane_weights) and self.num_reward_lanes > 1:
+                if self.use_soft_mellowmax and aggregate_reward_lanes and self.num_reward_lanes > 1:
+                    # single critic: smooth pessimistic reduction across reward lanes
+                    min_critic_value = self.reduce_reward_lanes(critic_values[0], reward_lane_weights)
+                elif exists(reward_lane_weights) and self.num_reward_lanes > 1:
                     # two hypotheses for twin-critic reduction across reward lanes:
                     # 1. sum_before_min = False (default): per-lane twin min then weighted sum across lanes (prevents cross-lane optimism masking)
                     # 2. sum_before_min = True: weighted sum across lanes per critic then twin min across critics
@@ -1147,6 +1223,9 @@ class MultipleCriticsWithClassificationLoss(Module):
         *critics: Critic | TransformerCritic,
         hl_gauss_loss: dict | HLGaussLossFromSupport,
         use_softmin = False,
+        use_soft_mellowmax = False,
+        soft_mellowmax_temperature = 1.,
+        soft_mellowmax_alpha = 0.,
         state_recon_loss_weight = 1.0,
         state_recon_loss_fn: Module = nn.MSELoss(),
         sum_reward_lanes_before_min = False
@@ -1163,11 +1242,20 @@ class MultipleCriticsWithClassificationLoss(Module):
         self.one_critic = len(critics) == 1
         self.critics = ModuleList(critics)
 
+        assert not (use_softmin and use_soft_mellowmax), 'choose either softmin or soft mellowmax'
+        assert not (use_soft_mellowmax and sum_reward_lanes_before_min), 'soft mellowmax already aggregates reward lanes'
+
+        if use_soft_mellowmax:
+            assert self.one_critic, 'soft mellowmax is only supported with a single critic'
+
         has_state_recons = tuple(critic.state_recon for critic in critics)
         assert len(set(has_state_recons)) == 1, 'critics must all have state_recon either enabled or disabled'
         self.has_state_recon = has_state_recons[0]
 
         self.use_softmin = use_softmin
+        self.use_soft_mellowmax = use_soft_mellowmax
+        self.soft_mellowmax_temperature = soft_mellowmax_temperature
+        self.soft_mellowmax_alpha = soft_mellowmax_alpha
         self.sum_reward_lanes_before_min = sum_reward_lanes_before_min
 
         # maybe state recon loss
@@ -1188,6 +1276,24 @@ class MultipleCriticsWithClassificationLoss(Module):
             return critic_values[0]
         return torch.minimum(*critic_values)
 
+    def reduce_reward_lanes(
+        self,
+        lane_values,
+        reward_lane_weights = None,
+        lane_dim = -1
+    ):
+        if exists(reward_lane_weights):
+            shape = [1] * lane_values.ndim
+            shape[lane_dim] = -1
+            lane_values = lane_values * reward_lane_weights.view(*shape)
+
+        return soft_mellowmax_min(
+            lane_values,
+            temperature = self.soft_mellowmax_temperature,
+            alpha = self.soft_mellowmax_alpha,
+            dim = lane_dim
+        )
+
     def forward(
         self,
         states: Float['b ...'],
@@ -1196,6 +1302,7 @@ class MultipleCriticsWithClassificationLoss(Module):
         target_values: Float['b ...'] | None = None,
         reward_lane_weights: Float['r'] | None = None,
         sum_reward_lanes_before_min: bool | None = None,
+        aggregate_reward_lanes = True,
         return_breakdown = False,
         loss_mask: Bool['b s'] | None = None,
         **kwargs
@@ -1227,7 +1334,10 @@ class MultipleCriticsWithClassificationLoss(Module):
             min_critic_values = []
 
             for critic_values in critics_values:
-                if exists(reward_lane_weights) and self.num_reward_lanes > 1:
+                if self.use_soft_mellowmax and aggregate_reward_lanes and self.num_reward_lanes > 1:
+                    # single critic: smooth pessimistic reduction across reward lanes
+                    min_critic_value = self.reduce_reward_lanes(critic_values[0], reward_lane_weights)
+                elif exists(reward_lane_weights) and self.num_reward_lanes > 1:
                     # two hypotheses for twin-critic reduction across reward lanes:
                     # 1. sum_before_min = False (default): per-lane twin min then weighted sum across lanes (prevents cross-lane optimism masking)
                     # 2. sum_before_min = True: weighted sum across lanes per critic then twin min across critics
@@ -1304,6 +1414,9 @@ class MultipleQuantileCritics(Module):
         *critics: Critic | TransformerCritic,
         quantiles: list[float] | Tensor | None = None,
         frac_atom_keep = 0.75, # will truncate 25% of the top values
+        use_soft_mellowmax = False,
+        soft_mellowmax_temperature = 1.,
+        soft_mellowmax_alpha = 0.,
         state_recon_loss_weight = 1.0,
         state_recon_loss_fn: Module = nn.MSELoss(),
         sum_reward_lanes_before_min = False
@@ -1318,9 +1431,18 @@ class MultipleQuantileCritics(Module):
         self.num_reward_lanes = next(iter(num_reward_lanes))
 
         self.num_critics = len(critics)
+        self.one_critic = len(critics) == 1
+
+        assert not (use_soft_mellowmax and sum_reward_lanes_before_min), 'soft mellowmax already aggregates reward lanes'
+
+        if use_soft_mellowmax:
+            assert self.one_critic, 'soft mellowmax is only supported with a single critic'
 
         self.critics = ModuleList(critics)
         self.num_atom_keep = int(frac_atom_keep * self.num_critics * self.num_quantiles)
+        self.use_soft_mellowmax = use_soft_mellowmax
+        self.soft_mellowmax_temperature = soft_mellowmax_temperature
+        self.soft_mellowmax_alpha = soft_mellowmax_alpha
         self.sum_reward_lanes_before_min = sum_reward_lanes_before_min
 
         # maybe state recon aux loss
@@ -1342,6 +1464,24 @@ class MultipleQuantileCritics(Module):
     def num_quantiles(self):
         return self.critics[0].dim_out
 
+    def reduce_reward_lanes(
+        self,
+        lane_values,
+        reward_lane_weights = None,
+        lane_dim = -2
+    ):
+        if exists(reward_lane_weights):
+            shape = [1] * lane_values.ndim
+            shape[lane_dim] = -1
+            lane_values = lane_values * reward_lane_weights.view(*shape)
+
+        return soft_mellowmax_min(
+            lane_values,
+            temperature = self.soft_mellowmax_temperature,
+            alpha = self.soft_mellowmax_alpha,
+            dim = lane_dim
+        )
+
     def forward(
         self,
         states: Float['b ...'],
@@ -1350,6 +1490,7 @@ class MultipleQuantileCritics(Module):
         target_values: Float['b ... q'] | None = None,
         reward_lane_weights: Float['r'] | None = None,
         sum_reward_lanes_before_min: bool | None = None,
+        aggregate_reward_lanes = True,
         truncate_quantiles_across_critics = False,
         return_breakdown = False,
         loss_mask: Bool['b s'] | None = None
@@ -1372,17 +1513,20 @@ class MultipleQuantileCritics(Module):
                 truncated_means_per_action = []
 
                 for critic_quantile_atoms in critics_quantile_atoms:
-                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and sum_before_min:
-                        critic_quantile_atoms = einsum('... r q, r -> ... q', critic_quantile_atoms, reward_lane_weights)
+                    if self.use_soft_mellowmax and aggregate_reward_lanes and self.num_reward_lanes > 1:
+                        quantile_atoms = self.reduce_reward_lanes(critic_quantile_atoms[0], reward_lane_weights)
+                    else:
+                        if exists(reward_lane_weights) and self.num_reward_lanes > 1 and sum_before_min:
+                            critic_quantile_atoms = einsum('... r q, r -> ... q', critic_quantile_atoms, reward_lane_weights)
 
-                    quantile_atoms = rearrange(critic_quantile_atoms, 'c b ... q -> b ... (q c)')
+                        quantile_atoms = rearrange(critic_quantile_atoms, 'c b ... q -> b ... (q c)')
 
                     # mean of the truncated distribution
 
                     truncated_quantiles = quantile_atoms.topk(self.num_atom_keep, largest = False).values
                     truncated_mean = truncated_quantiles.mean(dim = -1)
 
-                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and not sum_before_min:
+                    if not self.use_soft_mellowmax and exists(reward_lane_weights) and self.num_reward_lanes > 1 and not sum_before_min:
                         truncated_mean = einsum('... r, r -> ...', truncated_mean, reward_lane_weights)
 
                     truncated_means_per_action.append(truncated_mean)
@@ -1393,13 +1537,16 @@ class MultipleQuantileCritics(Module):
                 min_critic_value_per_action = []
 
                 for critic_quantile_atoms in critics_quantile_atoms:
-                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and sum_before_min:
-                        critic_quantile_atoms = einsum('... r q, r -> ... q', critic_quantile_atoms, reward_lane_weights)
+                    if self.use_soft_mellowmax and aggregate_reward_lanes and self.num_reward_lanes > 1:
+                        min_critic_value = self.reduce_reward_lanes(critic_quantile_atoms[0], reward_lane_weights)
+                    else:
+                        if exists(reward_lane_weights) and self.num_reward_lanes > 1 and sum_before_min:
+                            critic_quantile_atoms = einsum('... r q, r -> ... q', critic_quantile_atoms, reward_lane_weights)
 
-                    min_critic_value = torch.minimum(*critic_quantile_atoms)
+                        min_critic_value = torch.minimum(*critic_quantile_atoms)
 
-                    if exists(reward_lane_weights) and self.num_reward_lanes > 1 and not sum_before_min:
-                        min_critic_value = einsum('... r q, r -> ... q', min_critic_value, reward_lane_weights)
+                        if exists(reward_lane_weights) and self.num_reward_lanes > 1 and not sum_before_min:
+                            min_critic_value = einsum('... r q, r -> ... q', min_critic_value, reward_lane_weights)
 
                     min_critic_value_per_action.append(min_critic_value)
 
@@ -1547,6 +1694,9 @@ class SAC(Module):
         reward_scale = 1.,
         reward_lane_weights: tuple[float, ...] | list[float] | Tensor | None = None,
         sum_reward_lanes_before_min = False,
+        use_soft_mellowmax = False,
+        soft_mellowmax_temperature = 1.,
+        soft_mellowmax_alpha = 0.,
         actor_learning_rate = 3e-4,
         actor_regen_reg_rate = 1e-4,
         critic_target_ema_decay = 0.99,
@@ -1618,7 +1768,12 @@ class SAC(Module):
             assert len(critic_dim_outs) == 1, 'critics must all have the same output dimension'
             critic_dim_out = list(critic_dim_outs)[0]
 
-            critic_kwargs = dict(sum_reward_lanes_before_min = sum_reward_lanes_before_min)
+            critic_kwargs = dict(
+                sum_reward_lanes_before_min = sum_reward_lanes_before_min,
+                use_soft_mellowmax = use_soft_mellowmax,
+                soft_mellowmax_temperature = soft_mellowmax_temperature,
+                soft_mellowmax_alpha = soft_mellowmax_alpha
+            )
 
             if critic_dim_out == 1:
                 critic_klass = MultipleCritics
@@ -1881,13 +2036,21 @@ class SAC(Module):
             # using EMA, but also using online, if Minto is turned on - Ahmed Hendawy et al. https://arxiv.org/abs/2510.02590
 
             self.critics_target.eval()
-            next_cont_q_value, *next_discrete_q_values = self.critics_target(next_states, cont_actions = next_cont_actions)
+            next_cont_q_value, *next_discrete_q_values = self.critics_target(
+                next_states,
+                cont_actions = next_cont_actions,
+                aggregate_reward_lanes = False
+            )
 
             if self.use_minto:
                 was_training = self.critics.training
                 self.critics.eval()
 
-                online_next_cont_q_value, *online_next_discrete_q_values = self.critics(next_states, cont_actions = next_cont_actions)
+                online_next_cont_q_value, *online_next_discrete_q_values = self.critics(
+                    next_states,
+                    cont_actions = next_cont_actions,
+                    aggregate_reward_lanes = False
+                )
 
                 next_cont_q_value = torch.minimum(next_cont_q_value, online_next_cont_q_value)
                 next_discrete_q_values = tuple(torch.minimum(*ema_and_online) for ema_and_online in zip(next_discrete_q_values, online_next_discrete_q_values))

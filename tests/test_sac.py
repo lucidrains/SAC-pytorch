@@ -348,6 +348,65 @@ def test_multiple_critics_softmin():
     min_values = critics(states, cont_actions = cont_actions)
     assert len(min_values) == 1
 
+# mellowmax / soft mellowmax critic aggregation
+
+def test_mellowmax_operators():
+    from SAC_pytorch.SAC import mellowmax, soft_mellowmax_min
+
+    values = torch.randn(4, 1024)
+
+    # temperature -> 0 gives the mean, temperature -> inf gives the max / min
+
+    assert torch.allclose(mellowmax(values, temperature = 1000.), values.amax(dim = 0), atol = 1e-2)
+    assert torch.allclose(mellowmax(values, temperature = 0.01), values.mean(dim = 0), atol = 5e-2)
+    assert torch.allclose(soft_mellowmax_min(values, temperature = 1000.), values.amin(dim = 0), atol = 1e-2)
+    assert torch.allclose(soft_mellowmax_min(values, temperature = 0.01), values.mean(dim = 0), atol = 5e-2)
+
+def test_soft_mellowmax_one_critic():
+    from SAC_pytorch import SAC, Actor, Critic
+    from SAC_pytorch.SAC import MultipleCritics
+
+    critic_kwargs = dict(dim_state = 3, num_cont_actions = 2, dim_hidden = 8, num_reward_lanes = 2)
+
+    critics = MultipleCritics(
+        Critic(**critic_kwargs),
+        use_soft_mellowmax = True,
+        soft_mellowmax_temperature = 1.
+    )
+
+    states = torch.randn(4, 3)
+    cont_actions = torch.randn(4, 2)
+
+    aggregated, = critics(states, cont_actions = cont_actions)
+    _, breakdown = critics(states, cont_actions = cont_actions, return_breakdown = True)
+
+    lane_values = breakdown[0][0]
+    assert torch.all(aggregated >= lane_values.amin(dim = -1) - 1e-6)
+    assert torch.all(aggregated <= lane_values.mean(dim = -1) + 1e-6)
+
+    # only allowed with a single critic
+
+    with pytest.raises(AssertionError, match = 'single critic'):
+        MultipleCritics(Critic(**critic_kwargs), Critic(**critic_kwargs), use_soft_mellowmax = True)
+
+    # e2e sac with one critic and multiple reward lanes
+
+    agent = SAC(
+        actor = Actor(dim_state = 3, num_cont_actions = 2, dim_hidden = 8),
+        critics = [dict(**critic_kwargs)],
+        use_soft_mellowmax = True,
+        soft_mellowmax_temperature = 1.
+    )
+
+    agent(
+        states = states,
+        cont_actions = cont_actions,
+        discrete_actions = None,
+        rewards = torch.randn(4, 2),
+        done = torch.zeros(4).bool(),
+        next_states = states
+    )
+
 # learned entropy temperature target should be total entropy across action dims
 
 def test_learned_entropy_temperature_target():
